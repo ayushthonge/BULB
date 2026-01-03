@@ -1,0 +1,52 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "type": "npm",
+            "script": "watch",
+            "path": "extension",
+            "problemMatcher": {
+                "owner": "typescript",
+                "source": "ts",
+                "applyTo": "closedDocuments",
+                "fileLocation": [
+                    "relative",
+                    "${workspaceFolder}/extension"
+                ],
+                "pattern": [
+                    {
+                        "regexp": "^([a-zA-Z]+ \\d+ \\d+:\\d+:\\d+)(?: \\[([^\\]]+)\\])? \\w+ (\\w+) \"(.*?)\" (.*)$",
+                        "file": 4,
+                        "location": 5,
+                        "message": 5
+                    }
+                ],
+                "background": {
+                    "activeOnStart": true,
+                    "beginsPattern": "webpack",
+                    "endsPattern": "asset|built|compiled"
+                }
+            },
+            "isBackground": true,
+            "presentation": {
+                "reveal": "never",
+                "group": "build"
+            },
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "label": "npm: watch:extension"
+        },
+        {
+            "type": "npm",
+            "script": "compile",
+            "path": "extension",
+            "group": "build",
+            "problemMatcher": [
+                "$ts-webpack"
+            ],
+            "label": "npm: compile:extension"
+        }
+    ]
+}

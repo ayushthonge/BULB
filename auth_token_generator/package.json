@@ -1,0 +1,14 @@
+{
+  "name": "auth-token-generator",
+  "version": "1.0.0",
+  "description": "Generate Supabase auth tokens",
+  "main": "token.js",
+  "type": "module",
+  "scripts": {
+    "start": "node token.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.0",
+    "dotenv": "^17.2.3"
+  }
+}

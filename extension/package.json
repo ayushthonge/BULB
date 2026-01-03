@@ -1,0 +1,100 @@
+{
+    "name": "socratic-ai-extension",
+    "displayName": "Socratic AI Assistant",
+    "description": "A Socratic teaching assistant for coding.",
+    "version": "0.0.1",
+    "engines": {
+        "vscode": "^1.85.0"
+    },
+    "categories": [
+        "Other"
+    ],
+    "activationEvents": [],
+    "main": "./dist/extension.js",
+    "contributes": {
+        "viewsContainers": {
+            "activitybar": [
+                {
+                    "id": "socratic-sidebar",
+                    "title": "Socratic AI",
+                    "icon": "resources/duck-icon.svg"
+                }
+            ]
+        },
+        "views": {
+            "socratic-sidebar": [
+                {
+                    "type": "webview",
+                    "id": "socratic.chatView",
+                    "name": "Chat"
+                }
+            ]
+        },
+        "commands": [
+            {
+                "command": "socratic.openChat",
+                "title": "Socratic: Open Chat"
+            },
+            {
+                "command": "socratic.openChatRight",
+                "title": "Socratic: Open Chat on Right"
+            },
+            {
+                "command": "socratic.ask",
+                "title": "Ask Socratic AI"
+            },
+            {
+                "command": "socratic.setToken",
+                "title": "Socratic: Set Auth Token"
+            }
+        ],
+        "keybindings": [
+            {
+                "command": "socratic.openChat",
+                "key": "ctrl+shift+a",
+                "mac": "cmd+shift+a"
+            },
+            {
+                "command": "socratic.openChatRight",
+                "key": "ctrl+alt+shift+a",
+                "mac": "cmd+alt+shift+a"
+            }
+        ]
+    },
+    "scripts": {
+        "vscode:prepublish": "npm run package",
+        "compile": "webpack",
+        "watch": "webpack --watch",
+        "package": "webpack --mode production --devtool hidden-source-map",
+        "compile-tests": "tsc -p . --outDir out",
+        "watch-tests": "tsc -p . -w --outDir out",
+        "pretest": "npm run compile-tests && npm run compile && npm run lint",
+        "lint": "eslint src --ext ts",
+        "test": "node ./out/test/runTest.js"
+    },
+    "devDependencies": {
+        "@types/glob": "^8.1.0",
+        "@types/mocha": "^10.0.6",
+        "@types/node": "20.x",
+        "@types/react": "^19.2.7",
+        "@types/react-dom": "^19.2.3",
+        "@types/vscode": "^1.85.0",
+        "@typescript-eslint/eslint-plugin": "^6.19.1",
+        "@typescript-eslint/parser": "^6.19.1",
+        "css-loader": "^7.1.2",
+        "eslint": "^8.56.0",
+        "glob": "^8.1.0",
+        "mocha": "^10.2.0",
+        "postcss-loader": "^8.2.0",
+        "style-loader": "^4.0.0",
+        "ts-loader": "^9.5.1",
+        "typescript": "^5.3.3",
+        "webpack": "^5.90.1",
+        "webpack-cli": "^5.1.4"
+    },
+    "dependencies": {
+        "axios": "^1.6.7",
+        "react": "^18.2.0",
+        "react-dom": "^18.2.0"
+    }
+}

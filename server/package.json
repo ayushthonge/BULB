@@ -1,0 +1,28 @@
+{
+  "name": "socratic-server",
+  "version": "1.0.0",
+  "description": "Backend for Socratic AI VS Code Extension",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node-dev src/index.ts",
+    "test-chat": "ts-node src/scripts/test-chat.ts",
+    "test-gemini": "ts-node src/scripts/test-gemini-direct.ts",
+    "test-gemini-chat": "ts-node src/scripts/test-gemini-chat.ts"
+  },
+  "dependencies": {
+    "@fastify/cors": "^9.0.1",
+    "@google/generative-ai": "^0.24.1",
+    "@supabase/supabase-js": "^2.39.3",
+    "dotenv": "^16.4.1",
+    "fastify": "^4.26.1",
+    "fastify-cors": "^6.1.0",
+    "prom-client": "^15.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.17",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.3.3"
+  }
+}
