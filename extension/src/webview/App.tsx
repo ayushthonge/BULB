@@ -16,6 +16,8 @@ export default function App() {
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [currentContext, setCurrentContext] = useState<string>('');
+    const [sessionId, setSessionId] = useState<string>(() => generateSessionId());
+    const turnIndexRef = useRef<number>(0);
     const messagesEndRef = useRef<HTMLDivElement>(null);
 
     const scrollToBottom = () => {
@@ -51,10 +53,11 @@ export default function App() {
         setInput('');
         setLoading(true);
         setError(null);
+        turnIndexRef.current += 1;
 
         // If we have context, send immediately. Otherwise ask for it.
         if (currentContext) {
-            sendToBackend(currentInput, currentContext);
+            sendToBackend(currentInput, currentContext, newMessages);
         } else {
             vscode.postMessage({
                 type: 'askAI',
@@ -63,7 +66,7 @@ export default function App() {
         }
     };
 
-    const sendToBackend = async (prompt: string, context: string) => {
+    const sendToBackend = async (prompt: string, context: string, historyOverride?: { role: string; parts: string }[]) => {
         try {
             const res = await fetch('http://localhost:3000/chat', {
                 method: 'POST',
@@ -73,7 +76,9 @@ export default function App() {
                 body: JSON.stringify({
                     message: prompt,
                     context: context,
-                    history: messages
+                    history: historyOverride || messages,
+                    session_id: sessionId,
+                    turn_index: turnIndexRef.current
                 })
             });
 
@@ -83,6 +88,10 @@ export default function App() {
             }
 
             const data = await res.json();
+
+            if (data.session_id && data.session_id !== sessionId) {
+                setSessionId(data.session_id);
+            }
 
             if (data.response) {
                 setMessages(prev => [...prev, { role: 'assistant', parts: data.response }]);
@@ -101,6 +110,8 @@ export default function App() {
     const clearChat = () => {
         setMessages([]);
         setError(null);
+        turnIndexRef.current = 0;
+        setSessionId(generateSessionId());
     };
 
     return (
@@ -166,4 +177,11 @@ export default function App() {
             </div>
         </div>
     );
+}
+
+function generateSessionId() {
+    if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+        return crypto.randomUUID();
+    }
+    return Math.random().toString(36).slice(2, 10);
 }

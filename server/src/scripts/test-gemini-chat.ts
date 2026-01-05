@@ -3,24 +3,27 @@ import path from 'path';
 
 dotenv.config({ path: path.resolve(__dirname, '../../.env') });
 
-import { chatWithGemini } from '../gemini';
+import { generateSocraticQuestion } from '../gemini';
 
 async function testGeminiDirect() {
     console.log('Testing Gemini API with correct model...');
     console.log('API Key present:', !!process.env.GEMINI_API_KEY);
 
     try {
-        const response = await chatWithGemini(
-            [],
-            "What is a binary search tree? Give me a one sentence hint.",
-            ""
-        );
+        const { question, usage } = await generateSocraticQuestion({
+            targetedMisconception: 'off-by-one',
+            strategy: 'diagnostic',
+            userMessage: "What is a binary search tree?",
+            sessionSummary: "Student asking about data structures",
+            fileContext: ""
+        });
 
         console.log('\n✅ SUCCESS!');
         console.log('Gemini Response:');
         console.log('─'.repeat(50));
-        console.log(response);
+        console.log(question);
         console.log('─'.repeat(50));
+        console.log('Token Usage:', usage);
     } catch (err: any) {
         console.error('\n❌ FAILURE!');
         console.error('Error Message:', err.message);
