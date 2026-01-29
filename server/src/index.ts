@@ -13,8 +13,8 @@ fastify.register(cors, {
     origin: '*'
 });
 
-import { register } from './metrics';
-import { classifyMisconceptions, generateSessionSummary, generateSocraticQuestion } from './gemini';
+import { register, metrics } from './metrics';
+import { classifyMisconceptions, generateSocraticQuestion } from './gemini';
 import {
     applyVerdicts,
     chooseStrategy,
@@ -30,24 +30,65 @@ import {
 import { supabase } from './supabase';
 
 type SessionContext = {
-    state: ReturnType<typeof createSessionState>;
     startTime: string;
     endTime: string | null;
     userId: string | null;
+    queryOrder: string[];
+    activeQueryId: string | null;
+    queries: Map<string, QueryContext>;
+    persisted: boolean; // Track if session exists in DB
+};
+
+type QueryTurn = {
+    role: 'user' | 'assistant';
+    parts: string;
+    type?: 'question' | 'resolution';
+};
+
+type MisconceptionTimelineEntry = {
+    turnIndex: number;
+    targeted: string | null;
+    deltas: Record<string, number>;
+    confidenceBefore: number | null;
+    confidenceAfter: number | null;
+    resolved: boolean;
+};
+
+type QueryContext = {
+    id: string;
+    startTime: string;
+    endTime: string | null;
+    resolved: boolean;
+    resolvedAt: string | null;
+    state: ReturnType<typeof createSessionState>;
     intentCounts: Record<MessageIntent, number>;
     turnCount: number;
     directAnswerCount: number;
     reasoningCount: number;
     tokensIn: number;
     tokensOut: number;
-    persisted: boolean; // Track if session exists in DB
+    turns: QueryTurn[];
+    misconceptionTimeline: MisconceptionTimelineEntry[];
+    originalQuestion: string | null;
 };
 
 const newSessionContext = (userId?: string | null): SessionContext => ({
-    state: createSessionState(),
     startTime: new Date().toISOString(),
     endTime: null,
     userId: userId ?? null,
+    queryOrder: [],
+    activeQueryId: null,
+    queries: new Map(),
+    persisted: false
+});
+
+const newQueryContext = (id: string): QueryContext => ({
+    id,
+    startTime: new Date().toISOString(),
+    endTime: null,
+    resolved: false,
+    resolvedAt: null,
+    state: createSessionState(),
     intentCounts: {
         solution_request: 0,
         debugging: 0,
@@ -59,7 +100,9 @@ const newSessionContext = (userId?: string | null): SessionContext => ({
     reasoningCount: 0,
     tokensIn: 0,
     tokensOut: 0,
-    persisted: false
+    turns: [],
+    misconceptionTimeline: [],
+    originalQuestion: null
 });
 
 const sessionStore = new Map<string, SessionContext>();
@@ -74,7 +117,7 @@ fastify.get('/metrics', async (request, reply) => {
 // Chat Endpoint implementing misconception classifier pipeline
 fastify.post('/chat', async (request: any, reply) => {
     try {
-        const { message, history = [], context = '', session_id, turn_index, user_id } = request.body || {};
+        const { message, history = [], context = '', session_id, query_id, turn_index, user_id } = request.body || {};
 
         if (!message || typeof message !== 'string') {
             return reply.code(400).send({ error: 'Missing message' });
@@ -93,93 +136,125 @@ fastify.post('/chat', async (request: any, reply) => {
         }
 
         session.userId = user_id ?? session.userId;
-        session.state.turnIndex = typeof turn_index === 'number' ? turn_index : session.state.turnIndex + 1;
+
+        let queryId = typeof query_id === 'string' && query_id.trim() ? query_id.trim() : null;
+        let query: QueryContext | undefined = queryId ? session.queries.get(queryId) : undefined;
+
+        if (!query) {
+            queryId = randomSessionId();
+            query = newQueryContext(queryId);
+            session.queries.set(queryId, query);
+            session.queryOrder.push(queryId);
+            session.activeQueryId = queryId;
+        }
+
+        query.state.turnIndex = typeof turn_index === 'number' ? turn_index : query.state.turnIndex + 1;
+
+        if (query.resolved) {
+            return {
+                response: {
+                    type: 'resolution',
+                    text: 'This query is resolved. Start a new query to continue.'
+                },
+                session_id: sessionId,
+                query_id: queryId,
+                resolved: true,
+                is_new_session: isNewSession
+            };
+        }
 
         const sanitizedMessage = sanitizeUserInput(message);
         const sanitizedContext = typeof context === 'string' ? sanitizeUserInput(context) : '';
 
-        // Refresh summary every 3 turns or when empty
-        if (!session.state.summary || session.state.turnIndex % 3 === 0) {
-            session.state.summary = await generateSessionSummary(history);
-        }
-
-        const { intent, confidence, messageIntent } = inferIntentAndConfidence(sanitizedMessage, session.state.learnerConfidence);
-        session.state.learnerConfidence = confidence;
-        session.intentCounts[messageIntent] = (session.intentCounts[messageIntent] || 0) + 1;
+        const { intent, confidence, messageIntent } = inferIntentAndConfidence(sanitizedMessage, query.state.learnerConfidence);
+        query.state.learnerConfidence = confidence;
+        query.intentCounts[messageIntent] = (query.intentCounts[messageIntent] || 0) + 1;
         
         // Direct answer seeking
         if (messageIntent === 'solution_request') {
-            session.directAnswerCount += 1;
+            query.directAnswerCount += 1;
         }
         // Reasoning includes conceptual, clarification, and debugging (not direct solutions)
         if (messageIntent === 'conceptual' || messageIntent === 'clarification' || messageIntent === 'debugging') {
-            session.reasoningCount += 1;
+            query.reasoningCount += 1;
         }
 
-        const preUpdateMap = new Map(session.state.map);
+        const preUpdateMap = new Map(query.state.map);
 
         const { verdicts, classifierCertainty, usage: classifierUsage } = await classifyMisconceptions({
             userMessage: sanitizedMessage,
-            previousQuestion: session.state.lastQuestion,
-            sessionSummary: session.state.summary,
+            previousQuestion: query.state.lastQuestion,
             codeContext: sanitizedContext
         });
 
-        const update = applyVerdicts(session.state, verdicts);
-        const top = pickTopMisconception(session.state);
-        const strategy = chooseStrategy(intent, session.state.learnerConfidence, top?.confidence ?? null);
+        const update = applyVerdicts(query.state, verdicts);
+        const top = pickTopMisconception(query.state);
+        const strategy = chooseStrategy(intent, query.state.learnerConfidence, top?.confidence ?? null);
 
-        const { question, usage: generatorUsage, understood, summary } = await generateSocraticQuestion({
+        const { question, usage: generatorUsage } = await generateSocraticQuestion({
             targetedMisconception: top?.id || null,
             strategy,
             userMessage: sanitizedMessage,
-            sessionSummary: session.state.summary,
             fileContext: sanitizedContext,
-            lastQuestion: session.state.lastQuestion
+            lastQuestion: query.state.lastQuestion
         });
 
-        session.state.lastQuestion = question;
+        query.state.lastQuestion = question;
 
-        session.turnCount = session.state.turnIndex;
+        query.turnCount = query.state.turnIndex;
         // Don't auto-update endTime on every turn; only when session explicitly ends
 
         const tokensIn = (classifierUsage?.prompt || 0) + (generatorUsage?.prompt || 0);
         const tokensOut = (classifierUsage?.candidates || 0) + (generatorUsage?.candidates || 0);
-        session.tokensIn += tokensIn;
-        session.tokensOut += tokensOut;
+        query.tokensIn += tokensIn;
+        query.tokensOut += tokensOut;
 
         const targeted = top?.id || null;
         const confidenceBefore = targeted ? (preUpdateMap.get(targeted) ?? NEUTRAL_CONFIDENCE) : null;
-        const confidenceAfter = targeted ? (session.state.map.get(targeted) ?? 0) : null;
+        const confidenceAfter = targeted ? (query.state.map.get(targeted) ?? 0) : null;
         const resolved = targeted ? update.resolutionEvents.includes(targeted) : false;
-        
-        // Detect if all doubts resolved (no active misconceptions)
-        const allResolved = session.state.map.size === 0 && update.resolutionEvents.length > 0;
 
+        if (!query.originalQuestion) {
+            query.originalQuestion = sanitizedMessage;
+        }
+
+        query.turns.push({ role: 'user', parts: sanitizedMessage });
+        query.turns.push({ role: 'assistant', parts: question, type: 'question' });
+        query.misconceptionTimeline.push({
+            turnIndex: query.state.turnIndex,
+            targeted,
+            deltas: update.deltas,
+            confidenceBefore,
+            confidenceAfter,
+            resolved
+        });
+        
         // Append to history for the caller (extension keeps its own copy)
         const responsePayload = {
-            response: question,
+            response: {
+                type: 'question',
+                text: question
+            },
             session_id: sessionId,
+            query_id: queryId,
             targeted_misconception: targeted,
             classifier_certainty: classifierCertainty,
             deltas: update.deltas,
             resolution_events: update.resolutionEvents,
-            state: snapshotState(session.state),
+            state: snapshotState(query.state),
             tokens_in: tokensIn,
             tokens_out: tokensOut,
             intent: messageIntent,
             confidence_before: confidenceBefore,
             confidence_after: confidenceAfter,
             resolved,
-            all_doubts_resolved: allResolved,
-            is_new_session: isNewSession,
-            student_understood: understood,
-            learning_summary: summary || null
+            is_new_session: isNewSession
         };
 
         await logTurn({
             sessionId,
-            turnIndex: session.state.turnIndex,
+            queryId,
+            turnIndex: query.state.turnIndex,
             userMessage: sanitizedMessage,
             fileContext: sanitizedContext,
             question,
@@ -195,18 +270,6 @@ fastify.post('/chat', async (request: any, reply) => {
             tokensOut
         });
 
-        await upsertSessionMetrics({
-            sessionId,
-            userId: session.userId,
-            startTime: session.startTime,
-            endTime: session.endTime,
-            turnCount: session.turnCount,
-            directAnswerPct: session.turnCount > 0 ? Math.round((session.directAnswerCount / session.turnCount) * 100 * 100) / 100 : 0,
-            reasoningPct: session.turnCount > 0 ? Math.round((session.reasoningCount / session.turnCount) * 100 * 100) / 100 : 0,
-            tokensIn: session.tokensIn,
-            tokensOut: session.tokensOut
-        });
-
         return responsePayload;
     } catch (err: any) {
         console.error('----------------------------------------');
@@ -220,13 +283,6 @@ fastify.post('/chat', async (request: any, reply) => {
             hint: "Check server console for full logs"
         });
     }
-});
-
-// Summary Endpoint (no auth for testing)
-fastify.post('/summary', async (request: any, reply) => {
-    const { history } = request.body;
-    const summary = await generateSessionSummary(history);
-    return { summary };
 });
 
 fastify.get('/', async (request, reply) => {
@@ -253,70 +309,109 @@ fastify.post('/session/end', async (request: any, reply) => {
     const endTime = new Date().toISOString();
     session.endTime = endTime;
 
-    await upsertSessionMetrics({
-        sessionId: session_id,
-        userId: session.userId,
-        startTime: session.startTime,
-        endTime: endTime,
-        turnCount: session.turnCount,
-        directAnswerPct: session.turnCount > 0 ? Math.round((session.directAnswerCount / session.turnCount) * 100 * 100) / 100 : 0,
-        reasoningPct: session.turnCount > 0 ? Math.round((session.reasoningCount / session.turnCount) * 100 * 100) / 100 : 0,
-        tokensIn: session.tokensIn,
-        tokensOut: session.tokensOut
-    });
-
     // Optionally remove from memory
     sessionStore.delete(session_id);
 
     return { 
         success: true, 
-        session_id,
-        final_metrics: {
-            turn_count: session.turnCount,
-            direct_answer_pct: session.turnCount > 0 ? Math.round((session.directAnswerCount / session.turnCount) * 100 * 100) / 100 : 0,
-            reasoning_pct: session.turnCount > 0 ? Math.round((session.reasoningCount / session.turnCount) * 100 * 100) / 100 : 0,
-            tokens_in: session.tokensIn,
-            tokens_out: session.tokensOut
-        }
+        session_id
     };
 });
 
-// Start new doubt (ends current session and creates new one)
-fastify.post('/session/new-doubt', async (request: any, reply) => {
-    const { current_session_id, user_id } = request.body;
-    
-    // End current session if provided
-    if (current_session_id) {
-        const currentSession = sessionStore.get(current_session_id);
-        if (currentSession) {
-            const endTime = new Date().toISOString();
-            currentSession.endTime = endTime;
-            await upsertSessionMetrics({
-                sessionId: current_session_id,
-                userId: currentSession.userId,
-                startTime: currentSession.startTime,
-                endTime: endTime,
-                turnCount: currentSession.turnCount,
-                directAnswerPct: currentSession.turnCount > 0 ? Math.round((currentSession.directAnswerCount / currentSession.turnCount) * 100 * 100) / 100 : 0,
-                reasoningPct: currentSession.turnCount > 0 ? Math.round((currentSession.reasoningCount / currentSession.turnCount) * 100 * 100) / 100 : 0,
-                tokensIn: currentSession.tokensIn,
-                tokensOut: currentSession.tokensOut
-            });
-            sessionStore.delete(current_session_id);
-        }
+// Start a new query within a session
+fastify.post('/query/start', async (request: any, reply) => {
+    const { session_id, user_id } = request.body || {};
+    const sessionId = session_id || randomSessionId();
+    let session = sessionStore.get(sessionId);
+    let isNewSession = false;
+    if (!session) {
+        session = newSessionContext(user_id);
+        sessionStore.set(sessionId, session);
+        isNewSession = true;
+        await initializeSessionInDB(sessionId, session.userId, session.startTime);
+        session.persisted = true;
     }
 
-    // Create new session
-    const newSessionId = randomSessionId();
-    const newSession = newSessionContext(user_id);
-    sessionStore.set(newSessionId, newSession);
-    await initializeSessionInDB(newSessionId, newSession.userId, newSession.startTime);
-    newSession.persisted = true;
+    const queryId = randomSessionId();
+    const query = newQueryContext(queryId);
+    session.queries.set(queryId, query);
+    session.queryOrder.push(queryId);
+    session.activeQueryId = queryId;
 
-    return { 
+    return {
         success: true,
-        new_session_id: newSessionId,
-        previous_session_id: current_session_id || null
+        session_id: sessionId,
+        query_id: queryId,
+        is_new_session: isNewSession
+    };
+});
+
+// Explicit user-driven query resolution endpoint
+fastify.post('/query/resolve', async (request: any, reply) => {
+    const { session_id, query_id } = request.body || {};
+    if (!session_id) {
+        return reply.code(400).send({ error: 'Missing session_id' });
+    }
+    if (!query_id) {
+        return reply.code(400).send({ error: 'Missing query_id' });
+    }
+
+    const session = sessionStore.get(session_id);
+    if (!session) {
+        return reply.code(404).send({ error: 'Session not found' });
+    }
+
+    const query = session.queries.get(query_id);
+    if (!query) {
+        return reply.code(404).send({ error: 'Query not found' });
+    }
+
+    if (query.resolved) {
+        return {
+            success: true,
+            session_id,
+            query_id,
+            resolved: true,
+            response: {
+                type: 'resolution',
+                text: 'Query already resolved.'
+            }
+        };
+    }
+
+    const endTime = new Date().toISOString();
+    query.endTime = endTime;
+    query.resolved = true;
+    query.resolvedAt = endTime;
+
+    metrics.resolutionClicks.inc();
+    metrics.resolutionTurns.observe(query.turnCount);
+    const elapsedSeconds = Math.max(1, Math.round((Date.parse(endTime) - Date.parse(query.startTime)) / 1000));
+    metrics.resolutionLatencySeconds.observe(elapsedSeconds);
+
+    const summary = buildQuerySummary({
+        sessionId: session_id,
+        userId: session.userId,
+        query
+    });
+
+    await logQuerySummaryTrainingData({
+        sessionId: session_id,
+        userId: session.userId,
+        query,
+        summary
+    });
+
+    return {
+        success: true,
+        session_id,
+        query_id,
+        resolved: true,
+        response: {
+            type: 'resolution',
+            text: 'Query resolved by user.'
+        },
+        summary
     };
 });
 
@@ -342,6 +437,7 @@ async function initializeSessionInDB(sessionId: string, userId: string | null, s
 
 async function logTurn(params: {
     sessionId: string;
+    queryId: string;
     turnIndex: number;
     userMessage: string;
     fileContext: string;
@@ -358,8 +454,9 @@ async function logTurn(params: {
     tokensOut: number;
 }) {
     try {
-        await supabase.from('misconception_turns').insert({
+        await supabase.from('query_turns').insert({
             session_id: params.sessionId,
+            query_id: params.queryId,
             turn_index: params.turnIndex,
             user_message: params.userMessage,
             file_context: params.fileContext,
@@ -382,32 +479,66 @@ async function logTurn(params: {
     }
 }
 
-async function upsertSessionMetrics(params: {
+function buildQuerySummary(params: {
     sessionId: string;
     userId: string | null;
-    startTime: string;
-    endTime: string | null;
-    turnCount: number;
-    directAnswerPct: number;
-    reasoningPct: number;
-    tokensIn: number;
-    tokensOut: number;
+    query: QueryContext;
+}) {
+    const { query } = params;
+    const durationSeconds = query.startTime && query.resolvedAt
+        ? Math.max(1, Math.round((Date.parse(query.resolvedAt) - Date.parse(query.startTime)) / 1000))
+        : null;
+
+    const keyTurns = query.turns
+        .map((t, i) => ({ index: i + 1, role: t.role, text: t.parts, type: t.type }))
+        .slice(0, 6);
+
+    return {
+        session_id: params.sessionId,
+        query_id: query.id,
+        user_id: params.userId,
+        original_question: query.originalQuestion,
+        misconception_trajectory: query.misconceptionTimeline,
+        key_turns: keyTurns,
+        passive_metrics: {
+            turn_count: query.turnCount,
+            direct_answer_pct: query.turnCount > 0 ? Math.round((query.directAnswerCount / query.turnCount) * 100 * 100) / 100 : 0,
+            reasoning_pct: query.turnCount > 0 ? Math.round((query.reasoningCount / query.turnCount) * 100 * 100) / 100 : 0,
+            tokens_in: query.tokensIn,
+            tokens_out: query.tokensOut,
+            duration_seconds: durationSeconds
+        },
+        resolution_label: 'resolved_by_user',
+        resolved_at: query.resolvedAt
+    };
+}
+
+async function logQuerySummaryTrainingData(params: {
+    sessionId: string;
+    userId: string | null;
+    query: QueryContext;
+    summary: Record<string, unknown>;
 }) {
     try {
-        await supabase.from('misconception_sessions').upsert({
+        await supabase.from('query_summaries').insert({
             session_id: params.sessionId,
+            query_id: params.query.id,
             user_id: params.userId,
-            session_start_time: params.startTime,
-            session_end_time: params.endTime,
-            turn_count: params.turnCount,
-            direct_answer_pct: params.directAnswerPct,
-            reasoning_pct: params.reasoningPct,
-            tokens_in: params.tokensIn,
-            tokens_out: params.tokensOut,
-            updated_at: new Date().toISOString()
+            summary: params.summary,
+            created_at: new Date().toISOString()
+        });
+
+        await supabase.from('query_training_data').insert({
+            session_id: params.sessionId,
+            query_id: params.query.id,
+            user_id: params.userId,
+            label: 'resolved_by_user',
+            history: params.query.turns,
+            summary: params.summary,
+            created_at: new Date().toISOString()
         });
     } catch (error: any) {
-        console.warn('Supabase session upsert failed', error?.message);
+        console.warn('Query training data log failed', error?.message);
     }
 }
 

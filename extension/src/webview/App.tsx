@@ -11,12 +11,14 @@ declare global {
 const vscode = window.acquireVsCodeApi();
 
 export default function App() {
-    const [messages, setMessages] = useState<{ role: string, parts: string }[]>([]);
+    const [messages, setMessages] = useState<{ role: string, parts: string, type?: 'question' | 'resolution' }[]>([]);
     const [input, setInput] = useState('');
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [currentContext, setCurrentContext] = useState<string>('');
     const [sessionId, setSessionId] = useState<string>(() => generateSessionId());
+    const [queryId, setQueryId] = useState<string | null>(null);
+    const [isResolved, setIsResolved] = useState(false);
     const turnIndexRef = useRef<number>(0);
     const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -45,7 +47,7 @@ export default function App() {
     }, [messages]);
 
     const handleSend = () => {
-        if (!input.trim()) return;
+        if (!input.trim() || isResolved) return;
 
         const newMessages = [...messages, { role: 'user', parts: input }];
         setMessages(newMessages);
@@ -66,8 +68,67 @@ export default function App() {
         }
     };
 
+    const startNewQuery = async () => {
+        setLoading(true);
+        setError(null);
+        try {
+            const res = await fetch('http://localhost:3000/query/start', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    session_id: sessionId
+                })
+            });
+
+            if (!res.ok) {
+                const errData = await res.json().catch(() => ({ error: 'Unknown error' }));
+                throw new Error(errData.error || `Server Error: ${res.status}`);
+            }
+
+            const data = await res.json();
+            if (data.session_id && data.session_id !== sessionId) {
+                setSessionId(data.session_id);
+            }
+            if (data.query_id) {
+                setQueryId(data.query_id);
+            }
+            setMessages([]);
+            setIsResolved(false);
+            turnIndexRef.current = 0;
+        } catch (err: any) {
+            console.error('Start query error:', err);
+            setError(err.message || 'Failed to start new query');
+        } finally {
+            setLoading(false);
+        }
+    };
+
     const sendToBackend = async (prompt: string, context: string, historyOverride?: { role: string; parts: string }[]) => {
         try {
+            const ensureQueryId = queryId || (await (async () => {
+                const res = await fetch('http://localhost:3000/query/start', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ session_id: sessionId })
+                });
+                if (!res.ok) {
+                    const errData = await res.json().catch(() => ({ error: 'Unknown error' }));
+                    throw new Error(errData.error || `Server Error: ${res.status}`);
+                }
+                const data = await res.json();
+                if (data.session_id && data.session_id !== sessionId) {
+                    setSessionId(data.session_id);
+                }
+                if (data.query_id) {
+                    setQueryId(data.query_id);
+                }
+                return data.query_id as string;
+            })());
+
             const res = await fetch('http://localhost:3000/chat', {
                 method: 'POST',
                 headers: {
@@ -78,6 +139,7 @@ export default function App() {
                     context: context,
                     history: historyOverride || messages,
                     session_id: sessionId,
+                    query_id: ensureQueryId,
                     turn_index: turnIndexRef.current
                 })
             });
@@ -92,10 +154,16 @@ export default function App() {
             if (data.session_id && data.session_id !== sessionId) {
                 setSessionId(data.session_id);
             }
+            if (data.query_id && data.query_id !== queryId) {
+                setQueryId(data.query_id);
+            }
 
-            if (data.response) {
-                setMessages(prev => [...prev, { role: 'assistant', parts: data.response }]);
+            if (data.response?.text) {
+                setMessages(prev => [...prev, { role: 'assistant', parts: data.response.text, type: data.response.type }]);
                 setError(null);
+                if (data.response.type === 'resolution') {
+                    setIsResolved(true);
+                }
             }
         } catch (err: any) {
             console.error('Chat error:', err);
@@ -107,11 +175,52 @@ export default function App() {
         }
     };
 
+    const handleResolve = async () => {
+        if (loading || messages.length === 0 || isResolved || !queryId) return;
+        setLoading(true);
+        setError(null);
+
+        try {
+            const res = await fetch('http://localhost:3000/query/resolve', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    session_id: sessionId,
+                    query_id: queryId
+                })
+            });
+
+            if (!res.ok) {
+                const errData = await res.json().catch(() => ({ error: 'Unknown error' }));
+                throw new Error(errData.error || `Server Error: ${res.status}`);
+            }
+
+            const data = await res.json();
+            if (data.response?.text) {
+                setMessages(prev => [...prev, { role: 'assistant', parts: data.response.text, type: data.response.type }]);
+            }
+            if (data.summary) {
+                setMessages(prev => [...prev, { role: 'assistant', parts: `Summary: ${JSON.stringify(data.summary, null, 2)}`, type: 'resolution' }]);
+            }
+            setIsResolved(true);
+        } catch (err: any) {
+            console.error('Resolve error:', err);
+            const errorMsg = err.message || 'Resolution failed';
+            setMessages(prev => [...prev, { role: 'assistant', parts: `Error: ${errorMsg}` }]);
+            setError(errorMsg);
+        } finally {
+            setLoading(false);
+        }
+    };
+
     const clearChat = () => {
         setMessages([]);
         setError(null);
         turnIndexRef.current = 0;
-        setSessionId(generateSessionId());
+        setQueryId(null);
+        setIsResolved(false);
     };
 
     return (
@@ -121,6 +230,16 @@ export default function App() {
                     <div className="app-title">Socratic AI</div>
                 </div>
                 <div className="header-actions">
+                    {messages.length > 0 && (
+                        <button onClick={startNewQuery} className="new-query-btn" title="Start new query" disabled={loading}>
+                            New Query
+                        </button>
+                    )}
+                    {messages.length > 0 && (
+                        <button onClick={handleResolve} className="resolve-btn" title="Mark query resolved" disabled={loading || isResolved}>
+                            Query Resolved
+                        </button>
+                    )}
                     {messages.length > 0 && (
                         <button onClick={clearChat} className="clear-btn" title="Clear chat">
                             Clear
@@ -145,7 +264,7 @@ export default function App() {
                     </div>
                 ) : (
                     messages.map((m, i) => (
-                        <div key={i} className={`message message-${m.role}`}>
+                        <div key={i} className={`message message-${m.role} ${m.type === 'resolution' ? 'message-resolution' : ''}`}>
                             <div className="message-bubble">
                                 {m.parts}
                             </div>
@@ -167,11 +286,11 @@ export default function App() {
                         }
                     }}
                     className="message-input"
-                    placeholder="Ask a question... (Shift+Enter for new line)"
-                    disabled={loading}
+                    placeholder={isResolved ? 'This conversation is resolved. Clear to start a new one.' : 'Ask a question... (Shift+Enter for new line)'}
+                    disabled={loading || isResolved}
                     rows={2}
                 />
-                <button onClick={handleSend} disabled={loading || !input.trim()} className="send-button">
+                <button onClick={handleSend} disabled={loading || !input.trim() || isResolved} className="send-button">
                     {loading ? 'Sending...' : 'Send'}
                 </button>
             </div>

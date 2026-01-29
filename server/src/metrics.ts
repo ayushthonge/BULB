@@ -28,6 +28,20 @@ export const metrics = {
     activeSessions: new client.Gauge({
         name: 'active_sessions',
         help: 'Number of currently active chat sessions'
+    }),
+    resolutionClicks: new client.Counter({
+        name: 'resolution_clicks',
+        help: 'Number of times users explicitly marked a query as resolved'
+    }),
+    resolutionTurns: new client.Histogram({
+        name: 'resolution_turns',
+        help: 'Turns elapsed before user marked resolution',
+        buckets: [1, 2, 3, 5, 8, 13, 21]
+    }),
+    resolutionLatencySeconds: new client.Histogram({
+        name: 'resolution_latency_seconds',
+        help: 'Seconds from session start to user resolution click',
+        buckets: [30, 60, 120, 300, 600, 1200, 1800]
     })
 };
 

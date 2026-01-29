@@ -14,7 +14,6 @@ async function testGeminiDirect() {
             targetedMisconception: 'off-by-one',
             strategy: 'diagnostic',
             userMessage: "What is a binary search tree?",
-            sessionSummary: "Student asking about data structures",
             fileContext: ""
         });
 

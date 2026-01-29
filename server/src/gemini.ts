@@ -38,57 +38,6 @@ function extractUsage(meta: any): ModelUsage {
     return { prompt, candidates, total };
 }
 
-export async function checkUnderstanding(params: {
-    userMessage: string;
-    targetedMisconception: string | null;
-    sessionSummary: string;
-    lastQuestion: string | null;
-}): Promise<{ understood: boolean; summary: string }> {
-    const taxonomyEntry = MISCONCEPTION_TAXONOMY.find(t => t.id === params.targetedMisconception);
-    
-    const prompt = `You are evaluating if a student has demonstrated understanding of their coding issue.
-
-Targeted misconception: ${taxonomyEntry ? taxonomyEntry.label : 'general debugging'}
-Previous question asked: ${params.lastQuestion || 'none'}
-Student's response: ${params.userMessage}
-Session context: ${params.sessionSummary || 'none'}
-
-Determine if the student has:
-1. Identified the root cause of the issue
-2. Explained why it causes a problem
-3. Knows what needs to be fixed (even if not exact syntax)
-
-Respond with JSON only:
-{
-  "understood": true/false,
-  "summary": "<If understood=true, write a 1-sentence (under 20 words) summary of what they learned. Otherwise empty string>"
-}
-
-Examples:
-- If student says "the index goes out of range because i equals length" → understood=true, summary="Using <= with array length causes index out of bounds."
-- If student says "I'm not sure" → understood=false
-- If student correctly explains the fix → understood=true`;
-
-    try {
-        const result = await classifierModel.generateContent({
-            contents: [{ role: 'user', parts: [{ text: prompt }] }],
-            generationConfig: {
-                maxOutputTokens: 150,
-                responseMimeType: 'application/json'
-            }
-        });
-
-        const parsed = safeParseJson(result.response.text()) || {};
-        return {
-            understood: parsed.understood === true,
-            summary: typeof parsed.summary === 'string' ? parsed.summary.trim() : ''
-        };
-    } catch (error) {
-        console.error('Understanding check failed:', error);
-        return { understood: false, summary: '' };
-    }
-}
-
 function sanitizeToSingleQuestion(text: string) {
     const cleaned = text
         .replace(/[`*]/g, '')
@@ -132,7 +81,6 @@ function safeParseJson(text: string) {
 export async function classifyMisconceptions(params: {
     userMessage: string;
     previousQuestion: string | null;
-    sessionSummary: string;
     codeContext?: string;
 }) {
     const taxonomy = MISCONCEPTION_TAXONOMY.map(t => ({
@@ -171,7 +119,6 @@ Return ONLY JSON with this shape:
 
 taxonomy: ${JSON.stringify(taxonomy, null, 2)}
 previous_socratic_question: ${params.previousQuestion || 'none'}
-session_summary: ${params.sessionSummary || 'none'}
 file_context: ${params.codeContext || 'not provided'}
 user_message_untrusted: ${params.userMessage}`;
 
@@ -205,11 +152,10 @@ export async function generateSocraticQuestion(params: {
     targetedMisconception: string | null;
     strategy: Strategy;
     userMessage: string;
-    sessionSummary: string;
     fileContext?: string;
     lastQuestion?: string | null;
     retries?: number;
-}): Promise<{ question: string; usage: ModelUsage; understood: boolean; summary?: string }> {
+}): Promise<{ question: string; usage: ModelUsage }> {
     const taxonomyEntry = MISCONCEPTION_TAXONOMY.find(t => t.id === params.targetedMisconception);
     const prompt = `Role: Socratic programming tutor.
 Goal: Ask ONE short question (<20 words) that ADVANCES the student's understanding beyond what they just said.
@@ -218,7 +164,6 @@ Strategy: ${params.strategy}
 Targeted misconception: ${taxonomyEntry ? `${taxonomyEntry.label} — ${taxonomyEntry.description}` : 'None detected; keep diagnostic.'}
 Previous question: ${params.lastQuestion || 'none'}
 Student's latest response: ${params.userMessage}
-Session summary: ${params.sessionSummary || 'none'}
 File context: ${params.fileContext || 'not provided'}
 
 CRITICAL PROGRESSION RULES:
@@ -251,7 +196,7 @@ Respond with the single progressive question only.`;
 
             if (valid) {
                 metrics.hintLevelDistribution.observe(1);
-                return { question, usage: extractUsage(result.response?.usageMetadata), understood: false };
+                return { question, usage: extractUsage(result.response?.usageMetadata) };
             }
 
             console.warn('Question validation failed:', reason, 'raw:', question);
@@ -270,20 +215,6 @@ Respond with the single progressive question only.`;
     metrics.blockedPrompts.inc();
     const fallback = fallbackQuestion(params.targetedMisconception as any);
     const sanitized = sanitizeToSingleQuestion(fallback);
-    return { question: sanitized, usage: { prompt: 0, candidates: 0, total: 0 }, understood: false };
+    return { question: sanitized, usage: { prompt: 0, candidates: 0, total: 0 } };
 }
 
-export async function generateSessionSummary(messages: { role: string; parts: string }[]) {
-    const prompt = `Summarize the session in 2 bullet points max.
-Focus on concepts discussed and questions asked.
-Be under 60 words.
-
-History: ${JSON.stringify(messages).slice(0, 4000)} `;
-
-    const result = await generatorModel.generateContent({
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        generationConfig: { maxOutputTokens: 120 }
-    });
-
-    return result.response.text();
-}

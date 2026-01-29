@@ -80,6 +80,47 @@ body {
   color: var(--text-primary);
 }
 
+.resolve-btn {
+  padding: 5px 10px;
+  font-size: 11px;
+  background: var(--accent-blue);
+  border: 1px solid var(--accent-blue);
+  border-radius: 3px;
+  cursor: pointer;
+  color: white;
+  transition: background 0.15s;
+}
+
+.resolve-btn:hover:not(:disabled) {
+  background: var(--accent-blue-hover);
+}
+
+.resolve-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.new-query-btn {
+  padding: 5px 10px;
+  font-size: 11px;
+  background: transparent;
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  cursor: pointer;
+  color: var(--text-secondary);
+  transition: background 0.15s;
+}
+
+.new-query-btn:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.new-query-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 /* Context Bar */
 .context-bar {
   padding: 8px 16px;
@@ -242,6 +283,12 @@ body {
 .message-assistant .message-bubble {
   background: var(--assistant-msg-bg);
   border: none;
+}
+
+.message-resolution .message-bubble {
+  background: #12321c;
+  border: 1px solid #2f6f3a;
+  color: #c8facc;
 }
 
 .loading-indicator {

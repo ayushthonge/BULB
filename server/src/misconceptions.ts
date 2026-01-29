@@ -23,7 +23,6 @@ export interface MisconceptionState {
     map: Map<MisconceptionId, number>;
     learnerConfidence: number;
     lastQuestion: string | null;
-    summary: string;
     turnIndex: number;
 }
 
@@ -96,7 +95,6 @@ export function createSessionState(): MisconceptionState {
         map: new Map(),
         learnerConfidence: 0.5,
         lastQuestion: null,
-        summary: '',
         turnIndex: 0
     };
 }
@@ -306,7 +304,6 @@ export function snapshotState(state: MisconceptionState) {
         map: entries,
         learnerConfidence: state.learnerConfidence,
         lastQuestion: state.lastQuestion,
-        summary: state.summary,
         turnIndex: state.turnIndex
     };
 }
