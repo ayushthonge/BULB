@@ -218,3 +218,41 @@ Respond with the single progressive question only.`;
     return { question: sanitized, usage: { prompt: 0, candidates: 0, total: 0 } };
 }
 
+export async function generateCodeContextSummary(code: string): Promise<string> {
+    const MAX_INPUT = 8000; // Hard limit for summary generation
+    const truncated = code.length > MAX_INPUT ? code.slice(0, MAX_INPUT) + '\n... [truncated]' : code;
+    
+    const prompt = `Summarize this code in under 150 words. Focus on:
+- Main purpose and functionality
+- Key data structures and algorithms
+- Important functions/classes
+- Control flow patterns (loops, conditionals, async)
+- Edge cases or error handling
+
+Code:
+${truncated}
+
+Output only the summary, no preamble.`;
+
+    try {
+        const result = await classifierModel.generateContent({
+            contents: [{ role: 'user', parts: [{ text: prompt }] }],
+            generationConfig: { maxOutputTokens: 250 }
+        });
+
+        let summary = result.response.text().trim();
+        
+        // Hard budget: truncate to ~2k tokens (~8k chars)
+        if (summary.length > 8000) {
+            summary = summary.slice(0, 8000) + '...';
+        }
+        
+        return summary;
+    } catch (error: any) {
+        console.error('Code summary generation failed:', error.message);
+        // Fallback: basic extraction
+        const lines = code.split('\n');
+        const functions = lines.filter(l => /function|const.*=.*=>|class/.test(l)).slice(0, 10);
+        return `Code with ${lines.length} lines. Key definitions: ${functions.join('; ').slice(0, 500)}`;
+    }
+}

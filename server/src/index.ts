@@ -14,7 +14,7 @@ fastify.register(cors, {
 });
 
 import { register, metrics } from './metrics';
-import { classifyMisconceptions, generateSocraticQuestion } from './gemini';
+import { classifyMisconceptions, generateSocraticQuestion, generateCodeContextSummary } from './gemini';
 import {
     applyVerdicts,
     chooseStrategy,
@@ -28,6 +28,16 @@ import {
     randomSessionId
 } from './misconceptions';
 import { supabase } from './supabase';
+import crypto from 'crypto';
+
+type CodeContext = {
+    id: string;
+    hash: string;
+    fullCode: string;
+    summary: string;
+    symbols: string[];
+    createdAt: string;
+};
 
 type SessionContext = {
     startTime: string;
@@ -36,6 +46,8 @@ type SessionContext = {
     queryOrder: string[];
     activeQueryId: string | null;
     queries: Map<string, QueryContext>;
+    codeContexts: Map<string, CodeContext>;
+    activeContextId: string | null;
     persisted: boolean; // Track if session exists in DB
 };
 
@@ -79,6 +91,8 @@ const newSessionContext = (userId?: string | null): SessionContext => ({
     queryOrder: [],
     activeQueryId: null,
     queries: new Map(),
+    codeContexts: new Map(),
+    activeContextId: null,
     persisted: false
 });
 
@@ -117,7 +131,7 @@ fastify.get('/metrics', async (request, reply) => {
 // Chat Endpoint implementing misconception classifier pipeline
 fastify.post('/chat', async (request: any, reply) => {
     try {
-        const { message, history = [], context = '', session_id, query_id, turn_index, user_id } = request.body || {};
+        const { message, history = [], context = '', context_id, context_hash, session_id, query_id, turn_index, user_id } = request.body || {};
 
         if (!message || typeof message !== 'string') {
             return reply.code(400).send({ error: 'Missing message' });
@@ -150,6 +164,42 @@ fastify.post('/chat', async (request: any, reply) => {
 
         query.state.turnIndex = typeof turn_index === 'number' ? turn_index : query.state.turnIndex + 1;
 
+        // Handle code context: hash, cache, summarize
+        let codeContextRef: CodeContext | null = null;
+        let contextChanged = false;
+
+        if (context && typeof context === 'string' && context.trim()) {
+            const receivedHash = context_hash || crypto.createHash('md5').update(context).digest('hex');
+            const existingContext = context_id ? session.codeContexts.get(context_id) : null;
+
+            if (!existingContext || existingContext.hash !== receivedHash) {
+                // New or changed context - generate summary
+                contextChanged = true;
+                const contextId = context_id || randomSessionId();
+                const summary = await generateCodeContextSummary(context);
+                const symbols = extractSymbols(context);
+
+                codeContextRef = {
+                    id: contextId,
+                    hash: receivedHash,
+                    fullCode: context,
+                    summary,
+                    symbols,
+                    createdAt: new Date().toISOString()
+                };
+
+                session.codeContexts.set(contextId, codeContextRef);
+                session.activeContextId = contextId;
+            } else {
+                // Context unchanged - reuse cached
+                codeContextRef = existingContext;
+                contextChanged = false;
+            }
+        } else if (session.activeContextId) {
+            // No new context provided, use active cached context
+            codeContextRef = session.codeContexts.get(session.activeContextId) || null;
+        }
+
         if (query.resolved) {
             return {
                 response: {
@@ -164,7 +214,6 @@ fastify.post('/chat', async (request: any, reply) => {
         }
 
         const sanitizedMessage = sanitizeUserInput(message);
-        const sanitizedContext = typeof context === 'string' ? sanitizeUserInput(context) : '';
 
         const { intent, confidence, messageIntent } = inferIntentAndConfidence(sanitizedMessage, query.state.learnerConfidence);
         query.state.learnerConfidence = confidence;
@@ -181,21 +230,31 @@ fastify.post('/chat', async (request: any, reply) => {
 
         const preUpdateMap = new Map(query.state.map);
 
+        // Classifier receives summary only (or full code if context just changed)
+        const classifierContext = codeContextRef 
+            ? (contextChanged ? codeContextRef.fullCode : codeContextRef.summary)
+            : null;
+
         const { verdicts, classifierCertainty, usage: classifierUsage } = await classifyMisconceptions({
             userMessage: sanitizedMessage,
             previousQuestion: query.state.lastQuestion,
-            codeContext: sanitizedContext
+            codeContext: classifierContext
         });
 
         const update = applyVerdicts(query.state, verdicts);
         const top = pickTopMisconception(query.state);
         const strategy = chooseStrategy(intent, query.state.learnerConfidence, top?.confidence ?? null);
 
+        // Generator receives summary + relevant snippet
+        const generatorContext = codeContextRef
+            ? codeContextRef.summary + (top?.id ? extractRelevantSnippet(codeContextRef.fullCode, top.id) : '')
+            : null;
+
         const { question, usage: generatorUsage } = await generateSocraticQuestion({
             targetedMisconception: top?.id || null,
             strategy,
             userMessage: sanitizedMessage,
-            fileContext: sanitizedContext,
+            fileContext: generatorContext,
             lastQuestion: query.state.lastQuestion
         });
 
@@ -237,6 +296,9 @@ fastify.post('/chat', async (request: any, reply) => {
             },
             session_id: sessionId,
             query_id: queryId,
+            context_id: codeContextRef?.id || null,
+            context_hash: codeContextRef?.hash || null,
+            context_changed: contextChanged,
             targeted_misconception: targeted,
             classifier_certainty: classifierCertainty,
             deltas: update.deltas,
@@ -256,7 +318,7 @@ fastify.post('/chat', async (request: any, reply) => {
             queryId,
             turnIndex: query.state.turnIndex,
             userMessage: sanitizedMessage,
-            fileContext: sanitizedContext,
+            fileContext: codeContextRef?.id || null,
             question,
             targeted,
             classifierCertainty,
@@ -440,7 +502,7 @@ async function logTurn(params: {
     queryId: string;
     turnIndex: number;
     userMessage: string;
-    fileContext: string;
+    fileContext: string | null;
     question: string;
     targeted: string | null;
     classifierCertainty: number;
@@ -540,6 +602,53 @@ async function logQuerySummaryTrainingData(params: {
     } catch (error: any) {
         console.warn('Query training data log failed', error?.message);
     }
+}
+
+function extractSymbols(code: string): string[] {
+    const symbols: string[] = [];
+    const functionRegex = /(?:function|const|let|var)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*[=\(]/g;
+    const classRegex = /class\s+([a-zA-Z_$][a-zA-Z0-9_$]*)/g;
+    
+    let match;
+    while ((match = functionRegex.exec(code)) !== null) {
+        symbols.push(match[1]);
+    }
+    while ((match = classRegex.exec(code)) !== null) {
+        symbols.push(match[1]);
+    }
+    
+    return [...new Set(symbols)].slice(0, 20);
+}
+
+function extractRelevantSnippet(code: string, misconceptionId: string): string {
+    // Extract ~200 character snippet around loops, arrays, etc based on misconception
+    const keywords: Record<string, string[]> = {
+        'off-by-one': ['for', 'while', '[', 'length', 'size'],
+        'mutation-vs-reassignment': ['push', 'pop', 'splice', '='],
+        'return-vs-print': ['return', 'console', 'print'],
+        'async-vs-parallel': ['async', 'await', 'Promise'],
+        'null-checks': ['null', 'undefined', '?.', '??'],
+        'scope-shadowing': ['let', 'const', 'var', '{'],
+        'statefulness': ['state', 'this.', 'useState'],
+        'side-effects': ['=', 'push', 'splice']
+    };
+    
+    const searchTerms = keywords[misconceptionId] || [];
+    if (searchTerms.length === 0) return '';
+    
+    const lines = code.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+        for (const term of searchTerms) {
+            if (lines[i].includes(term)) {
+                const start = Math.max(0, i - 2);
+                const end = Math.min(lines.length, i + 3);
+                const snippet = lines.slice(start, end).join('\n');
+                return snippet.length > 500 ? snippet.slice(0, 500) + '...' : snippet;
+            }
+        }
+    }
+    
+    return '';
 }
 
 const start = async () => {

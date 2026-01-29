@@ -16,6 +16,8 @@ export default function App() {
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [currentContext, setCurrentContext] = useState<string>('');
+    const [contextHash, setContextHash] = useState<string>('');
+    const [contextId, setContextId] = useState<string | null>(null);
     const [sessionId, setSessionId] = useState<string>(() => generateSessionId());
     const [queryId, setQueryId] = useState<string | null>(null);
     const [isResolved, setIsResolved] = useState(false);
@@ -35,10 +37,14 @@ export default function App() {
             const message = event.data;
             if (message.type === 'context-response') {
                 const context = message.value;
+                const hash = hashString(context);
+                
                 setCurrentContext(context);
+                setContextHash(hash);
+                
                 const userPrompt = message.originalMessage;
                 if (userPrompt) {
-                    sendToBackend(userPrompt, context);
+                    sendToBackend(userPrompt, context, hash);
                 }
             }
         };
@@ -59,7 +65,7 @@ export default function App() {
 
         // If we have context, send immediately. Otherwise ask for it.
         if (currentContext) {
-            sendToBackend(currentInput, currentContext, newMessages);
+            sendToBackend(currentInput, currentContext, contextHash, newMessages);
         } else {
             vscode.postMessage({
                 type: 'askAI',
@@ -105,7 +111,7 @@ export default function App() {
         }
     };
 
-    const sendToBackend = async (prompt: string, context: string, historyOverride?: { role: string; parts: string }[]) => {
+    const sendToBackend = async (prompt: string, context: string, hash: string, historyOverride?: { role: string; parts: string }[]) => {
         try {
             const ensureQueryId = queryId || (await (async () => {
                 const res = await fetch('http://localhost:3000/query/start', {
@@ -137,6 +143,8 @@ export default function App() {
                 body: JSON.stringify({
                     message: prompt,
                     context: context,
+                    context_id: contextId,
+                    context_hash: hash,
                     history: historyOverride || messages,
                     session_id: sessionId,
                     query_id: ensureQueryId,
@@ -156,6 +164,13 @@ export default function App() {
             }
             if (data.query_id && data.query_id !== queryId) {
                 setQueryId(data.query_id);
+            }
+            if (data.context_id && data.context_id !== contextId) {
+                setContextId(data.context_id);
+            }
+            if (data.context_changed) {
+                // Server regenerated summary, update hash
+                setContextHash(data.context_hash || contextHash);
             }
 
             if (data.response?.text) {
@@ -220,6 +235,8 @@ export default function App() {
         setError(null);
         turnIndexRef.current = 0;
         setQueryId(null);
+        setContextId(null);
+        setContextHash('');
         setIsResolved(false);
     };
 
@@ -303,4 +320,14 @@ function generateSessionId() {
         return crypto.randomUUID();
     }
     return Math.random().toString(36).slice(2, 10);
+}
+
+function hashString(str: string): string {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+        const char = str.charCodeAt(i);
+        hash = ((hash << 5) - hash) + char;
+        hash = hash & hash; // Convert to 32bit integer
+    }
+    return hash.toString(16);
 }
