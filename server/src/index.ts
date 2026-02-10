@@ -147,12 +147,14 @@ fastify.post('/chat', async (request: any, reply) => {
             // Persist session immediately to avoid FK constraint violations
             await initializeSessionInDB(sessionId, session.userId, session.startTime);
             session.persisted = true;
+            metrics.activeSessions.inc();
         }
 
         session.userId = user_id ?? session.userId;
 
-        let queryId = typeof query_id === 'string' && query_id.trim() ? query_id.trim() : null;
-        let query: QueryContext | undefined = queryId ? session.queries.get(queryId) : undefined;
+        const incomingQueryId = typeof query_id === 'string' && query_id.trim() ? query_id.trim() : null;
+        let query: QueryContext | undefined = incomingQueryId ? session.queries.get(incomingQueryId) : undefined;
+        let queryId: string;
 
         if (!query) {
             queryId = randomSessionId();
@@ -160,6 +162,8 @@ fastify.post('/chat', async (request: any, reply) => {
             session.queries.set(queryId, query);
             session.queryOrder.push(queryId);
             session.activeQueryId = queryId;
+        } else {
+            queryId = incomingQueryId!;
         }
 
         query.state.turnIndex = typeof turn_index === 'number' ? turn_index : query.state.turnIndex + 1;
@@ -238,7 +242,7 @@ fastify.post('/chat', async (request: any, reply) => {
         const { verdicts, classifierCertainty, usage: classifierUsage } = await classifyMisconceptions({
             userMessage: sanitizedMessage,
             previousQuestion: query.state.lastQuestion,
-            codeContext: classifierContext
+            codeContext: classifierContext ?? undefined
         });
 
         const update = applyVerdicts(query.state, verdicts);
@@ -254,7 +258,7 @@ fastify.post('/chat', async (request: any, reply) => {
             targetedMisconception: top?.id || null,
             strategy,
             userMessage: sanitizedMessage,
-            fileContext: generatorContext,
+            fileContext: generatorContext ?? undefined,
             lastQuestion: query.state.lastQuestion
         });
 
@@ -332,6 +336,8 @@ fastify.post('/chat', async (request: any, reply) => {
             tokensOut
         });
 
+        await updateSessionMetricsRow(sessionId, session);
+
         return responsePayload;
     } catch (err: any) {
         console.error('----------------------------------------');
@@ -371,8 +377,16 @@ fastify.post('/session/end', async (request: any, reply) => {
     const endTime = new Date().toISOString();
     session.endTime = endTime;
 
+    const aggregates = aggregateSessionStats(session);
+    if (aggregates.turnCount <= 1) {
+        metrics.dropOffRate.inc();
+    }
+
+    await updateSessionMetricsRow(session_id, session, endTime);
+
     // Optionally remove from memory
     sessionStore.delete(session_id);
+    metrics.activeSessions.dec();
 
     return { 
         success: true, 
@@ -392,6 +406,7 @@ fastify.post('/query/start', async (request: any, reply) => {
         isNewSession = true;
         await initializeSessionInDB(sessionId, session.userId, session.startTime);
         session.persisted = true;
+        metrics.activeSessions.inc();
     }
 
     const queryId = randomSessionId();
@@ -448,6 +463,7 @@ fastify.post('/query/resolve', async (request: any, reply) => {
 
     metrics.resolutionClicks.inc();
     metrics.resolutionTurns.observe(query.turnCount);
+    metrics.avgTurnsPerSession.observe(query.turnCount);
     const elapsedSeconds = Math.max(1, Math.round((Date.parse(endTime) - Date.parse(query.startTime)) / 1000));
     metrics.resolutionLatencySeconds.observe(elapsedSeconds);
 
@@ -463,6 +479,8 @@ fastify.post('/query/resolve', async (request: any, reply) => {
         query,
         summary
     });
+
+    await updateSessionMetricsRow(session_id, session);
 
     return {
         success: true,
@@ -494,6 +512,44 @@ async function initializeSessionInDB(sessionId: string, userId: string | null, s
     } catch (error: any) {
         console.error('Failed to initialize session in DB:', error?.message);
         throw error; // Critical error - should not proceed
+    }
+}
+
+function aggregateSessionStats(session: SessionContext) {
+    let turnCount = 0;
+    let directAnswers = 0;
+    let reasoning = 0;
+    let tokensIn = 0;
+    let tokensOut = 0;
+
+    session.queries.forEach(q => {
+        turnCount += q.turnCount;
+        directAnswers += q.directAnswerCount;
+        reasoning += q.reasoningCount;
+        tokensIn += q.tokensIn;
+        tokensOut += q.tokensOut;
+    });
+
+    const directPct = turnCount > 0 ? Math.round((directAnswers / turnCount) * 100 * 100) / 100 : 0;
+    const reasoningPct = turnCount > 0 ? Math.round((reasoning / turnCount) * 100 * 100) / 100 : 0;
+
+    return { turnCount, directPct, reasoningPct, tokensIn, tokensOut };
+}
+
+async function updateSessionMetricsRow(sessionId: string, session: SessionContext, endTimeOverride?: string) {
+    try {
+        const aggregates = aggregateSessionStats(session);
+        await supabase.from('misconception_sessions').update({
+            turn_count: aggregates.turnCount,
+            direct_answer_pct: aggregates.directPct,
+            reasoning_pct: aggregates.reasoningPct,
+            tokens_in: aggregates.tokensIn,
+            tokens_out: aggregates.tokensOut,
+            session_end_time: endTimeOverride || session.endTime,
+            updated_at: new Date().toISOString()
+        }).eq('session_id', sessionId);
+    } catch (error: any) {
+        console.warn('Session metrics update failed', error?.message);
     }
 }
 

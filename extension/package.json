@@ -9,7 +9,13 @@
     "categories": [
         "Other"
     ],
-    "activationEvents": [],
+    "activationEvents": [
+        "onView:socratic.chatView",
+        "onCommand:socratic.openChat",
+        "onCommand:socratic.openChatRight",
+        "onCommand:socratic.ask",
+        "onCommand:socratic.setToken"
+    ],
     "main": "./dist/extension.js",
     "contributes": {
         "viewsContainers": {
