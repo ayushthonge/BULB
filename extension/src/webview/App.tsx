@@ -288,7 +288,11 @@ export default function App() {
                         </div>
                     ))
                 )}
-                {loading && <div className="loading-indicator">Thinking...</div>}
+                {loading && (
+                    <div className="loading-indicator" aria-label="loading">
+                        <span className="spinner" />
+                    </div>
+                )}
                 <div ref={messagesEndRef} />
             </div>
 

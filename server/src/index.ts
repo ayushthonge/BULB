@@ -2,15 +2,19 @@
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import dotenv from 'dotenv';
+import { authenticate, AuthenticatedRequest } from './auth';
+import { rateLimit } from './rateLimit';
+import { recordRequestMetric } from './telemetry';
 
 dotenv.config();
 
 const fastify = Fastify({
-    logger: true
+    logger: true,
+    bodyLimit: 256 * 1024 // cap payload size to ~256KB to avoid oversized context uploads
 });
 
 fastify.register(cors, {
-    origin: '*'
+    origin: process.env.CORS_ORIGIN || '*'
 });
 
 import { register, metrics } from './metrics';
@@ -82,7 +86,10 @@ type QueryContext = {
     turns: QueryTurn[];
     misconceptionTimeline: MisconceptionTimelineEntry[];
     originalQuestion: string | null;
+    hintLevel: number;
 };
+
+const MAX_CONTEXT_CHARS = 24000; // reasonable cap: allows medium files but blocks very large payloads
 
 const newSessionContext = (userId?: string | null): SessionContext => ({
     startTime: new Date().toISOString(),
@@ -116,7 +123,8 @@ const newQueryContext = (id: string): QueryContext => ({
     tokensOut: 0,
     turns: [],
     misconceptionTimeline: [],
-    originalQuestion: null
+    originalQuestion: null,
+    hintLevel: 1
 });
 
 const sessionStore = new Map<string, SessionContext>();
@@ -129,19 +137,25 @@ fastify.get('/metrics', async (request, reply) => {
 });
 
 // Chat Endpoint implementing misconception classifier pipeline
-fastify.post('/chat', async (request: any, reply) => {
+fastify.post('/chat', { preHandler: [authenticate, rateLimit] }, async (request: AuthenticatedRequest & any, reply) => {
+    const reqStart = Date.now();
     try {
         const { message, history = [], context = '', context_id, context_hash, session_id, query_id, turn_index, user_id } = request.body || {};
+        const authedUserId = request.user?.id || user_id || null;
 
         if (!message || typeof message !== 'string') {
             return reply.code(400).send({ error: 'Missing message' });
+        }
+
+        if (context && typeof context === 'string' && context.length > MAX_CONTEXT_CHARS) {
+            return reply.code(413).send({ error: `Context too large. Limit ${MAX_CONTEXT_CHARS} characters.` });
         }
 
         const sessionId = session_id || randomSessionId();
         let session = sessionStore.get(sessionId);
         let isNewSession = false;
         if (!session) {
-            session = newSessionContext(user_id);
+            session = newSessionContext(authedUserId);
             sessionStore.set(sessionId, session);
             isNewSession = true;
             // Persist session immediately to avoid FK constraint violations
@@ -150,7 +164,7 @@ fastify.post('/chat', async (request: any, reply) => {
             metrics.activeSessions.inc();
         }
 
-        session.userId = user_id ?? session.userId;
+        session.userId = authedUserId ?? session.userId;
 
         const incomingQueryId = typeof query_id === 'string' && query_id.trim() ? query_id.trim() : null;
         let query: QueryContext | undefined = incomingQueryId ? session.queries.get(incomingQueryId) : undefined;
@@ -164,6 +178,10 @@ fastify.post('/chat', async (request: any, reply) => {
             session.activeQueryId = queryId;
         } else {
             queryId = incomingQueryId!;
+        }
+
+        if (query.hintLevel === undefined || query.hintLevel === null) {
+            query.hintLevel = 1;
         }
 
         query.state.turnIndex = typeof turn_index === 'number' ? turn_index : query.state.turnIndex + 1;
@@ -259,10 +277,12 @@ fastify.post('/chat', async (request: any, reply) => {
             strategy,
             userMessage: sanitizedMessage,
             fileContext: generatorContext ?? undefined,
-            lastQuestion: query.state.lastQuestion
+            lastQuestion: query.state.lastQuestion,
+            hintLevel: query.hintLevel
         });
 
         query.state.lastQuestion = question;
+        query.hintLevel = Math.min(query.hintLevel + 1, 5);
 
         query.turnCount = query.state.turnIndex;
         // Don't auto-update endTime on every turn; only when session explicitly ends
@@ -338,8 +358,26 @@ fastify.post('/chat', async (request: any, reply) => {
 
         await updateSessionMetricsRow(sessionId, session);
 
+        await recordRequestMetric({
+            userId: session.userId,
+            path: '/chat',
+            statusCode: 200,
+            latencyMs: Date.now() - reqStart,
+            tokensIn,
+            tokensOut,
+            modelStatus: 'ok'
+        });
+
         return responsePayload;
     } catch (err: any) {
+        await recordRequestMetric({
+            userId: (request as any).user?.id,
+            path: '/chat',
+            statusCode: 500,
+            latencyMs: Date.now() - reqStart,
+            modelStatus: 'error',
+            modelError: err?.message
+        });
         console.error('----------------------------------------');
         console.error('CHAT ENDPOINT ERROR:');
         console.error('Message:', err.message);
@@ -363,7 +401,7 @@ fastify.get('/health', async (request, reply) => {
 });
 
 // End session explicitly
-fastify.post('/session/end', async (request: any, reply) => {
+fastify.post('/session/end', { preHandler: [authenticate, rateLimit] }, async (request: AuthenticatedRequest & any, reply) => {
     const { session_id } = request.body;
     if (!session_id) {
         return reply.code(400).send({ error: 'Missing session_id' });
@@ -395,13 +433,14 @@ fastify.post('/session/end', async (request: any, reply) => {
 });
 
 // Start a new query within a session
-fastify.post('/query/start', async (request: any, reply) => {
+fastify.post('/query/start', { preHandler: [authenticate, rateLimit] }, async (request: AuthenticatedRequest & any, reply) => {
     const { session_id, user_id } = request.body || {};
+    const authedUserId = request.user?.id || user_id || null;
     const sessionId = session_id || randomSessionId();
     let session = sessionStore.get(sessionId);
     let isNewSession = false;
     if (!session) {
-        session = newSessionContext(user_id);
+        session = newSessionContext(authedUserId);
         sessionStore.set(sessionId, session);
         isNewSession = true;
         await initializeSessionInDB(sessionId, session.userId, session.startTime);
@@ -424,7 +463,7 @@ fastify.post('/query/start', async (request: any, reply) => {
 });
 
 // Explicit user-driven query resolution endpoint
-fastify.post('/query/resolve', async (request: any, reply) => {
+fastify.post('/query/resolve', { preHandler: [authenticate, rateLimit] }, async (request: AuthenticatedRequest & any, reply) => {
     const { session_id, query_id } = request.body || {};
     if (!session_id) {
         return reply.code(400).send({ error: 'Missing session_id' });

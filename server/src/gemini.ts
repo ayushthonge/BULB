@@ -68,6 +68,23 @@ function sanitizeToSingleQuestion(text: string) {
 
     return question || 'What happens when the list is empty?';
 }
+
+function getHintStrengthPrompt(level: number) {
+    switch (level) {
+        case 1:
+            return 'HINT LEVEL 1 (orienting): Ask a broad, diagnostic check about behavior or inputs. Keep it general, no solution clues.';
+        case 2:
+            return 'HINT LEVEL 2 (focus): Narrow to the area involved (data, boundary, condition). Still no solution wording.';
+        case 3:
+            return 'HINT LEVEL 3 (edge case): Point at a specific scenario or boundary to test. Avoid naming the fix.';
+        case 4:
+            return 'HINT LEVEL 4 (mechanism): Ask about the missing check/guard/ordering needed. Describe the kind of check, not the exact code.';
+        case 5:
+            return 'HINT LEVEL 5 (near-solution): Ask about the precise place/value to verify so they can state the fix themselves; never state the fix.';
+        default:
+            return 'HINT LEVEL (diagnostic): Ask a short question that probes understanding without giving the answer.';
+    }
+}
 function safeParseJson(text: string) {
     try {
         const match = text.match(/\{[\s\S]*\}/);
@@ -155,10 +172,16 @@ export async function generateSocraticQuestion(params: {
     fileContext?: string;
     lastQuestion?: string | null;
     retries?: number;
+    hintLevel?: number;
 }): Promise<{ question: string; usage: ModelUsage }> {
     const taxonomyEntry = MISCONCEPTION_TAXONOMY.find(t => t.id === params.targetedMisconception);
+    const hintLevel = params.hintLevel ?? 1;
+    const hintGuidance = getHintStrengthPrompt(hintLevel);
     const prompt = `Role: Socratic programming tutor.
 Goal: Ask ONE short question (<20 words) that ADVANCES the student's understanding beyond what they just said.
+
+Hint progression: ${hintGuidance}
+Never reveal the solution; keep the student reasoning.
 
 Strategy: ${params.strategy}
 Targeted misconception: ${taxonomyEntry ? `${taxonomyEntry.label} — ${taxonomyEntry.description}` : 'None detected; keep diagnostic.'}
@@ -181,6 +204,8 @@ Hard rules:
 - Must BUILD ON what student just said
 - Keep under 20 words
 
+Do NOT provide the answer. Ask a single, stronger hint question per the hint level.
+
 Respond with the single progressive question only.`;
 
     const retries = params.retries ?? 2;
@@ -195,7 +220,7 @@ Respond with the single progressive question only.`;
             const { valid, reason } = hardValidateQuestion(question, params.lastQuestion);
 
             if (valid) {
-                metrics.hintLevelDistribution.observe(1);
+                metrics.hintLevelDistribution.observe(hintLevel);
                 return { question, usage: extractUsage(result.response?.usageMetadata) };
             }
 
