@@ -25,6 +25,7 @@ import {
     applyVerdicts,
     chooseStrategy,
     createSessionState,
+    detectLearnerSignals,
     inferIntentAndConfidence,
     MessageIntent,
     NEUTRAL_CONFIDENCE,
@@ -34,6 +35,7 @@ import {
     snapshotState,
     randomSessionId
 } from './misconceptions';
+import { assessResolution, ResolutionState } from './resolution';
 import { dbInsert, dbUpdate, pool } from './db';
 import { inspectUserInput } from './guards/inputGuard';
 import { config, validateConfig } from './config';
@@ -92,6 +94,9 @@ type QueryContext = {
     misconceptionTimeline: MisconceptionTimelineEntry[];
     originalQuestion: string | null;
     hintLevel: number;
+    // Cross-turn counters feeding the resolution detector / frustration handling.
+    highConfidenceStreak: number;
+    frustrationStreak: number;
 };
 
 const MAX_CONTEXT_CHARS = 24000; // reasonable cap: allows medium files but blocks very large payloads
@@ -131,7 +136,9 @@ const newQueryContext = (id: string): QueryContext => ({
     turns: [],
     misconceptionTimeline: [],
     originalQuestion: null,
-    hintLevel: 1
+    hintLevel: 1,
+    highConfidenceStreak: 0,
+    frustrationStreak: 0
 });
 
 const sessionStore = new Map<string, SessionContext>();
@@ -397,7 +404,115 @@ fastify.post('/chat', { preHandler: authPreHandlers }, async (request: Authentic
         const update = applyVerdicts(query.state, verdicts);
         const top = pickTopMisconception(query.state);
         const topTwo = pickTopMisconceptions(query.state, 2, 0.5);
-        const strategy = chooseStrategy(intent, messageIntent, top?.id ?? null);
+
+        const targeted = top?.id || null;
+        const confidenceBefore = targeted ? (preUpdateMap.get(targeted) ?? NEUTRAL_CONFIDENCE) : null;
+        const confidenceAfter = targeted ? (query.state.map.get(targeted) ?? 0) : null;
+        const resolved = targeted ? update.resolutionEvents.includes(targeted) : false;
+
+        if (!query.originalQuestion) {
+            query.originalQuestion = sanitizedMessage;
+        }
+
+        // ---- Resolution / frustration assessment (derived, no extra LLM call) ----
+        const learnerSignals = detectLearnerSignals(sanitizedMessage);
+
+        if (query.state.learnerConfidence >= 0.7) query.highConfidenceStreak += 1;
+        else query.highConfidenceStreak = 0;
+
+        const lowProgressTurn =
+            (learnerSignals.solutionSeeking || learnerSignals.confusion || messageIntent === 'solution_request') &&
+            !learnerSignals.understanding && !learnerSignals.articulatedCause;
+        if (lowProgressTurn) query.frustrationStreak += 1;
+        else query.frustrationStreak = 0;
+
+        const everTargeted =
+            query.state.map.size > 0 ||
+            preUpdateMap.size > 0 ||
+            update.resolutionEvents.length > 0 ||
+            query.misconceptionTimeline.some(e => !!e.targeted);
+
+        const resolution: ResolutionState = assessResolution({
+            activeMap: Array.from(query.state.map.entries()).map(([id, confidence]) => ({ id, confidence })),
+            everTargeted,
+            resolutionEventsThisTurn: update.resolutionEvents.length,
+            newMisconceptionThisTurn: verdicts.some(v => v.status === 'new'),
+            messageIntent,
+            understanding: learnerSignals.understanding,
+            articulatedCause: learnerSignals.articulatedCause,
+            confusion: learnerSignals.confusion,
+            solutionSeeking: learnerSignals.solutionSeeking,
+            highConfidenceStreak: query.highConfidenceStreak,
+            frustrationStreak: query.frustrationStreak
+        });
+
+        // ---- Auto-resolution fast path: finalize WITHOUT a generator call ----
+        if (config.autoResolveEnabled && resolution.action === 'auto_resolve') {
+            const closeText =
+                "It sounds like you've worked out what was going on — and you explained why, which is the part that sticks. I'll close this query; start a new one whenever you're ready.";
+            const tokensInAuto = classifierUsage?.prompt || 0;
+            const tokensOutAuto = classifierUsage?.candidates || 0;
+            query.tokensIn += tokensInAuto;
+            query.tokensOut += tokensOutAuto;
+            query.turnCount = query.state.turnIndex;
+
+            query.turns.push({ role: 'user', parts: sanitizedMessage });
+            query.turns.push({ role: 'assistant', parts: closeText, type: 'resolution' });
+            query.misconceptionTimeline.push({
+                turnIndex: query.state.turnIndex, targeted, deltas: update.deltas,
+                confidenceBefore, confidenceAfter, resolved: true
+            });
+
+            await logTurn({
+                sessionId, queryId, turnIndex: query.state.turnIndex,
+                userMessage: sanitizedMessage, fileContext: codeContextRef?.id || null,
+                question: closeText, targeted, classifierCertainty,
+                rawVerdicts: verdicts, deltas: update.deltas, resolutions: update.resolutionEvents,
+                confidenceBefore, confidenceAfter, resolved: true, resolutionSource: 'auto_detected',
+                intent: messageIntent, strategy: 'auto_resolve', hintLevel: query.hintLevel,
+                learnerConfidence: query.state.learnerConfidence,
+                tokensIn: tokensInAuto, tokensOut: tokensOutAuto,
+                resolutionScore: resolution.score, resolutionStatus: resolution.status,
+                resolutionSignals: resolution.signals
+            });
+
+            const summary = await finalizeQueryResolution(sessionId, session, query, 'auto');
+
+            await recordRequestMetric({
+                userId: session.userId, path: '/chat', statusCode: 200,
+                latencyMs: Date.now() - reqStart, tokensIn: tokensInAuto, tokensOut: tokensOutAuto,
+                modelStatus: 'auto_resolved'
+            });
+
+            return {
+                response: { type: 'resolution', text: closeText },
+                session_id: sessionId, query_id: queryId,
+                context_id: codeContextRef?.id || null, context_hash: codeContextRef?.hash || null,
+                context_changed: contextChanged, targeted_misconception: targeted,
+                classifier_certainty: classifierCertainty, deltas: update.deltas,
+                resolution_events: update.resolutionEvents, state: snapshotState(query.state),
+                tokens_in: tokensInAuto, tokens_out: tokensOutAuto, intent: messageIntent,
+                confidence_before: confidenceBefore, confidence_after: confidenceAfter,
+                resolved: true,
+                resolution: {
+                    status: resolution.status, score: resolution.score,
+                    action: resolution.action, signals: resolution.signals,
+                    frustration: resolution.frustration
+                },
+                summary,
+                is_new_session: isNewSession
+            };
+        }
+
+        // ---- Otherwise pick a strategy, biasing toward a reflective close or a
+        // more concrete (still non-answer) probe when the learner is stuck. ----
+        let strategy = chooseStrategy(intent, messageIntent, top?.id ?? null);
+        if (resolution.action === 'confirm_resolution') {
+            strategy = 'reflective';
+        }
+        if (resolution.frustration) {
+            query.hintLevel = 3; // most concrete hint level the output guard still allows
+        }
 
         // Generator receives summary + relevant snippets for up to 2 misconceptions
         let generatorContext: string | null = null;
@@ -430,15 +545,6 @@ fastify.post('/chat', { preHandler: authPreHandlers }, async (request: Authentic
         const tokensOut = (classifierUsage?.candidates || 0) + (generatorUsage?.candidates || 0);
         query.tokensIn += tokensIn;
         query.tokensOut += tokensOut;
-
-        const targeted = top?.id || null;
-        const confidenceBefore = targeted ? (preUpdateMap.get(targeted) ?? NEUTRAL_CONFIDENCE) : null;
-        const confidenceAfter = targeted ? (query.state.map.get(targeted) ?? 0) : null;
-        const resolved = targeted ? update.resolutionEvents.includes(targeted) : false;
-
-        if (!query.originalQuestion) {
-            query.originalQuestion = sanitizedMessage;
-        }
 
         query.turns.push({ role: 'user', parts: sanitizedMessage });
         query.turns.push({ role: 'assistant', parts: question, type: 'question' });
@@ -473,6 +579,13 @@ fastify.post('/chat', { preHandler: authPreHandlers }, async (request: Authentic
             confidence_before: confidenceBefore,
             confidence_after: confidenceAfter,
             resolved,
+            resolution: {
+                status: resolution.status,
+                score: resolution.score,
+                action: resolution.action,
+                signals: resolution.signals,
+                frustration: resolution.frustration
+            },
             is_new_session: isNewSession
         };
 
@@ -497,7 +610,10 @@ fastify.post('/chat', { preHandler: authPreHandlers }, async (request: Authentic
             hintLevel: query.hintLevel,
             learnerConfidence: query.state.learnerConfidence,
             tokensIn,
-            tokensOut
+            tokensOut,
+            resolutionScore: resolution.score,
+            resolutionStatus: resolution.status,
+            resolutionSignals: resolution.signals
         });
 
         await updateSessionMetricsRow(sessionId, session);
@@ -657,25 +773,7 @@ fastify.post('/query/resolve', { preHandler: authPreHandlers }, async (request: 
         };
     }
 
-    const endTime = new Date().toISOString();
-    query.endTime = endTime;
-    query.resolved = true;
-    query.resolvedAt = endTime;
-
-    const summary = buildQuerySummary({
-        sessionId: session_id,
-        userId: session.userId,
-        query
-    });
-
-    await logQuerySummaryTrainingData({
-        sessionId: session_id,
-        userId: session.userId,
-        query,
-        summary
-    });
-
-    await updateSessionMetricsRow(session_id, session);
+    const summary = await finalizeQueryResolution(session_id, session, query, 'user');
 
     return {
         success: true,
@@ -689,6 +787,45 @@ fastify.post('/query/resolve', { preHandler: authPreHandlers }, async (request: 
         summary
     };
 });
+
+/**
+ * Finalize a query as resolved — used by both the manual /query/resolve endpoint
+ * (source 'user') and the automatic resolution detector (source 'auto'). Marks
+ * the query resolved, builds the longitudinal summary + training row with the
+ * correct label, and refreshes session metrics.
+ */
+async function finalizeQueryResolution(
+    sessionId: string,
+    session: SessionContext,
+    query: QueryContext,
+    source: 'user' | 'auto'
+) {
+    if (!query.resolved) {
+        const endTime = new Date().toISOString();
+        query.endTime = endTime;
+        query.resolved = true;
+        query.resolvedAt = endTime;
+    }
+
+    const label = source === 'auto' ? 'auto_resolved' : 'resolved_by_user';
+    const summary = buildQuerySummary({
+        sessionId,
+        userId: session.userId,
+        query,
+        resolutionLabel: label
+    });
+
+    await logQuerySummaryTrainingData({
+        sessionId,
+        userId: session.userId,
+        query,
+        summary,
+        label
+    });
+
+    await updateSessionMetricsRow(sessionId, session);
+    return summary;
+}
 
 async function initializeSessionInDB(sessionId: string, userId: string | null, startTime: string) {
     try {
@@ -789,6 +926,9 @@ async function logTurn(params: {
     learnerConfidence: number;
     tokensIn: number;
     tokensOut: number;
+    resolutionScore?: number | null;
+    resolutionStatus?: string | null;
+    resolutionSignals?: string[];
 }) {
     try {
         await dbInsert('query_turns', {
@@ -813,6 +953,9 @@ async function logTurn(params: {
             learner_confidence: params.learnerConfidence,
             tokens_in: params.tokensIn,
             tokens_out: params.tokensOut,
+            resolution_score: params.resolutionScore ?? null,
+            resolution_status: params.resolutionStatus ?? null,
+            resolution_signals: params.resolutionSignals ? JSON.stringify(params.resolutionSignals) : null,
             created_at: new Date().toISOString()
         });
     } catch (error: any) {
@@ -825,6 +968,7 @@ function buildQuerySummary(params: {
     sessionId: string;
     userId: string | null;
     query: QueryContext;
+    resolutionLabel?: string;
 }) {
     const { query } = params;
     const durationSeconds = query.startTime && query.resolvedAt
@@ -868,7 +1012,7 @@ function buildQuerySummary(params: {
                 ? Math.round((autoResolved.size / allTargeted.size) * 100) / 100
                 : null
         },
-        resolution_label: 'resolved_by_user',
+        resolution_label: params.resolutionLabel ?? 'resolved_by_user',
         resolved_at: query.resolvedAt
     };
 }
@@ -878,6 +1022,7 @@ async function logQuerySummaryTrainingData(params: {
     userId: string | null;
     query: QueryContext;
     summary: Record<string, unknown>;
+    label?: string;
 }) {
     try {
         await dbInsert('query_summaries', {
@@ -892,7 +1037,7 @@ async function logQuerySummaryTrainingData(params: {
             session_id: params.sessionId,
             query_id: params.query.id,
             user_id: params.userId,
-            label: 'resolved_by_user',
+            label: params.label ?? 'resolved_by_user',
             history: JSON.stringify(params.query.turns),
             summary: JSON.stringify(params.summary),
             created_at: new Date().toISOString()

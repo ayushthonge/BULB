@@ -380,6 +380,43 @@ export function inferIntentAndConfidence(message: string, priorConfidence: numbe
     return { intent, confidence, messageIntent, signalDirection };
 }
 
+export interface LearnerSignals {
+    /** Explicit closure / comprehension ("now I get it", "makes sense", "thanks"). */
+    understanding: boolean;
+    /** Articulating a cause or self-correcting ("the problem is...", "it's because..."). */
+    articulatedCause: boolean;
+    /** Expressed confusion / being stuck. */
+    confusion: boolean;
+    /** Explicitly asking for the answer to be handed over. */
+    solutionSeeking: boolean;
+}
+
+/**
+ * Detect pedagogically meaningful signals in a learner utterance. These feed
+ * the resolution detector and frustration handling. Pure and regex-based so
+ * they cost nothing and are deterministic/testable. (Note: causal words like
+ * "because" are fine FROM the learner — they are only forbidden in tutor output.)
+ */
+export function detectLearnerSignals(message: string): LearnerSignals {
+    const lower = (message || '').toLowerCase();
+
+    const understanding =
+        /\b(now i (understand|get it|see)|i (understand|get) it now|that makes sense|makes sense now|i see (it )?now|oh,? i see|got it|gotcha|that('s| is) (clear|helpful))\b/.test(lower) &&
+        !/\b(do(n'?t| not)|never|not really|still (don'?t|not))\s+(understand|get|see|make sense)\b/.test(lower);
+
+    const articulatedCause =
+        /\b(the (problem|issue|bug|error|reason) is|it'?s because|that'?s because|i (see|realize|notice|found|think) (that|the|it|i)|so it (means|happens|would)|i was wrong|actually,? (it|the|i))\b/.test(lower);
+
+    const confusion =
+        /\b(i'?m (confused|lost|stuck)|completely (lost|confused)|no (idea|clue)|i (?:still |really |just )?do(?:n'?t| not) (?:understand|get|know))\b/.test(lower) ||
+        /\?{2,}/.test(message || '');
+
+    const solutionSeeking =
+        /\b(just tell me|give me the (answer|solution|code|fix)|what'?s the (answer|fix|solution)|do it for me|fix it for me|i give up)\b/.test(lower);
+
+    return { understanding, articulatedCause, confusion, solutionSeeking };
+}
+
 export function sanitizeUserInput(input: string) {
     return input
         .replace(/[\u0000-\u001F\u007F]/g, '')

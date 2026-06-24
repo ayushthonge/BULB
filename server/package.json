@@ -7,7 +7,7 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "ts-node-dev src/index.ts",
-    "test": "node --require ts-node/register/transpile-only --test src/__tests__/guards.test.ts",
+    "test": "node --require ts-node/register/transpile-only --test src/__tests__/guards.test.ts src/__tests__/resolution.test.ts src/__tests__/misconceptions.test.ts",
     "test-chat": "ts-node src/scripts/test-chat.ts",
     "test-gemini": "ts-node src/scripts/test-gemini-direct.ts",
     "test-gemini-chat": "ts-node src/scripts/test-gemini-chat.ts"

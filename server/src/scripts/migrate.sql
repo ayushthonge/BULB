@@ -49,6 +49,9 @@ CREATE TABLE IF NOT EXISTS query_turns (
     learner_confidence NUMERIC(4,3),
     tokens_in INTEGER DEFAULT 0,
     tokens_out INTEGER DEFAULT 0,
+    resolution_score NUMERIC(5,3),
+    resolution_status TEXT,
+    resolution_signals JSONB,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -92,3 +95,13 @@ CREATE INDEX IF NOT EXISTS idx_query_turns_misconception ON query_turns(targeted
 CREATE INDEX IF NOT EXISTS idx_whitelist_token ON whitelist_users(token);
 CREATE INDEX IF NOT EXISTS idx_request_metrics_created ON request_metrics(created_at);
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON misconception_sessions(user_id);
+
+-- ---------------------------------------------------------------------------
+-- Migration 002: automatic resolution tracking.
+-- Idempotent ALTERs so existing deployments pick up the new columns by simply
+-- re-running this script (the whole file is safe to run repeatedly).
+-- ---------------------------------------------------------------------------
+ALTER TABLE query_turns ADD COLUMN IF NOT EXISTS resolution_score NUMERIC(5,3);
+ALTER TABLE query_turns ADD COLUMN IF NOT EXISTS resolution_status TEXT;
+ALTER TABLE query_turns ADD COLUMN IF NOT EXISTS resolution_signals JSONB;
+CREATE INDEX IF NOT EXISTS idx_query_turns_resolution_status ON query_turns(resolution_status);

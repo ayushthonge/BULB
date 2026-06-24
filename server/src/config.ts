@@ -104,6 +104,12 @@ export interface AppConfig {
     authCacheTtlMs: number;
     /** Max sessions held in the in-memory state cache before LRU eviction. */
     stateCacheMax: number;
+    /**
+     * When true, a query that reaches the auto-resolution bar is finalized
+     * automatically (and the generator call is skipped). When false, the same
+     * situation only prompts the learner to confirm, preserving full agency.
+     */
+    autoResolveEnabled: boolean;
 }
 
 export const config: AppConfig = Object.freeze({
@@ -157,6 +163,7 @@ export const config: AppConfig = Object.freeze({
 
     authCacheTtlMs: envInt('AUTH_CACHE_TTL_MS', 60000),
     stateCacheMax: envInt('STATE_CACHE_MAX', 500),
+    autoResolveEnabled: envBool('AUTO_RESOLVE_ENABLED', true),
 });
 
 /**
