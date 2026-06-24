@@ -1,8 +1,9 @@
 import { FastifyReply, FastifyRequest } from 'fastify';
+import { config } from './config';
 
-const WINDOW_MS = parseInt(process.env.RATE_LIMIT_WINDOW_MS || '60000'); // 1 minute default
-const USER_MAX = parseInt(process.env.RATE_LIMIT_PER_USER || '10');
-const GLOBAL_MAX = parseInt(process.env.RATE_LIMIT_GLOBAL || '15'); // 30 RPM Gemini / 2 calls per chat = 15
+const WINDOW_MS = config.rateLimit.windowMs; // 1 minute default
+const USER_MAX = config.rateLimit.perUser;
+const GLOBAL_MAX = config.rateLimit.global; // 30 RPM Gemini / 2 calls per chat = 15
 
 const userBuckets: Map<string, { windowStart: number; count: number }> = new Map();
 let globalWindowStart = Date.now();

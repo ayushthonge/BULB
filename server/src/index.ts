@@ -13,11 +13,11 @@ const fastify = Fastify({
     bodyLimit: 256 * 1024 // cap payload size to ~256KB to avoid oversized context uploads
 });
 
-const enableWhitelist = process.env.ENABLE_WHITELIST !== 'false';
+const enableWhitelist = config.enableWhitelist;
 const authPreHandlers = enableWhitelist ? [authenticate, rateLimit] : [rateLimit];
 
 fastify.register(cors, {
-    origin: process.env.CORS_ORIGIN || '*'
+    origin: config.corsOrigin
 });
 
 import { classifyMisconceptions, generateSocraticQuestion, generateCodeContextSummary } from './gemini';
@@ -36,7 +36,7 @@ import {
     randomSessionId
 } from './misconceptions';
 import { assessResolution, ResolutionState } from './resolution';
-import { dbInsert, dbUpdate, pool } from './db';
+import { dbInsert, dbUpdate, dbSelectOne, pool } from './db';
 import { inspectUserInput } from './guards/inputGuard';
 import { config, validateConfig } from './config';
 import crypto from 'crypto';
@@ -99,8 +99,8 @@ type QueryContext = {
     frustrationStreak: number;
 };
 
-const MAX_CONTEXT_CHARS = 24000; // reasonable cap: allows medium files but blocks very large payloads
-const MAX_CONTEXT_LINES = 60; // hard limit: students should focus on small, targeted code snippets
+const MAX_CONTEXT_CHARS = config.context.maxChars; // cap: blocks very large payloads
+const MAX_CONTEXT_LINES = config.context.maxLines; // students focus on small, targeted snippets
 
 const newSessionContext = (userId?: string | null): SessionContext => ({
     startTime: new Date().toISOString(),
@@ -143,6 +143,91 @@ const newQueryContext = (id: string): QueryContext => ({
 
 const sessionStore = new Map<string, SessionContext>();
 
+// Bound in-memory growth: evict oldest sessions once over the configured cap.
+// Live conversations survive eviction because their pedagogical state is
+// write-through persisted (see persistQueryState/rehydrateQuery below).
+function evictIfNeeded() {
+    while (sessionStore.size > config.stateCacheMax) {
+        const oldest = sessionStore.keys().next().value;
+        if (oldest === undefined) break;
+        sessionStore.delete(oldest);
+    }
+}
+
+// Compact, serializable snapshot of a query's pedagogical state (everything the
+// pipeline needs to continue a conversation). Full transcripts live in
+// query_turns; this is only the live working state.
+function serializeQuery(query: QueryContext) {
+    return {
+        id: query.id,
+        startTime: query.startTime,
+        endTime: query.endTime,
+        resolved: query.resolved,
+        resolvedAt: query.resolvedAt,
+        stateMap: Array.from(query.state.map.entries()),
+        learnerConfidence: query.state.learnerConfidence,
+        lastQuestion: query.state.lastQuestion,
+        turnIndex: query.state.turnIndex,
+        intentCounts: query.intentCounts,
+        turnCount: query.turnCount,
+        directAnswerCount: query.directAnswerCount,
+        reasoningCount: query.reasoningCount,
+        tokensIn: query.tokensIn,
+        tokensOut: query.tokensOut,
+        originalQuestion: query.originalQuestion,
+        hintLevel: query.hintLevel,
+        highConfidenceStreak: query.highConfidenceStreak,
+        frustrationStreak: query.frustrationStreak
+    };
+}
+
+// Best-effort write-through of a query's state. Never throws into the request path.
+async function persistQueryState(sessionId: string, userId: string | null, query: QueryContext) {
+    try {
+        await pool.query(
+            `INSERT INTO query_state (session_id, query_id, user_id, state, updated_at)
+             VALUES ($1, $2, $3, $4, NOW())
+             ON CONFLICT (session_id, query_id)
+             DO UPDATE SET state = EXCLUDED.state, user_id = EXCLUDED.user_id, updated_at = NOW()`,
+            [sessionId, query.id, userId, JSON.stringify(serializeQuery(query))]
+        );
+    } catch (err: any) {
+        console.warn('persistQueryState failed', err?.message);
+    }
+}
+
+// Rehydrate a query's working state after a restart / cache eviction.
+async function rehydrateQuery(sessionId: string, queryId: string): Promise<QueryContext | null> {
+    try {
+        const row = await dbSelectOne('query_state', 'state', { session_id: sessionId, query_id: queryId });
+        if (!row?.state) return null;
+        const s = typeof row.state === 'string' ? JSON.parse(row.state) : row.state;
+        const query = newQueryContext(queryId);
+        query.startTime = s.startTime ?? query.startTime;
+        query.endTime = s.endTime ?? null;
+        query.resolved = !!s.resolved;
+        query.resolvedAt = s.resolvedAt ?? null;
+        query.state.map = new Map(Array.isArray(s.stateMap) ? s.stateMap : []);
+        query.state.learnerConfidence = s.learnerConfidence ?? 0.5;
+        query.state.lastQuestion = s.lastQuestion ?? null;
+        query.state.turnIndex = s.turnIndex ?? 0;
+        query.intentCounts = s.intentCounts ?? query.intentCounts;
+        query.turnCount = s.turnCount ?? 0;
+        query.directAnswerCount = s.directAnswerCount ?? 0;
+        query.reasoningCount = s.reasoningCount ?? 0;
+        query.tokensIn = s.tokensIn ?? 0;
+        query.tokensOut = s.tokensOut ?? 0;
+        query.originalQuestion = s.originalQuestion ?? null;
+        query.hintLevel = s.hintLevel ?? 1;
+        query.highConfidenceStreak = s.highConfidenceStreak ?? 0;
+        query.frustrationStreak = s.frustrationStreak ?? 0;
+        return query;
+    } catch (err: any) {
+        console.warn('rehydrateQuery failed', err?.message);
+        return null;
+    }
+}
+
 // Chat Endpoint implementing misconception classifier pipeline
 fastify.post('/chat', { preHandler: authPreHandlers }, async (request: AuthenticatedRequest & any, reply) => {
     const reqStart = Date.now();
@@ -175,8 +260,10 @@ fastify.post('/chat', { preHandler: authPreHandlers }, async (request: Authentic
         if (!session) {
             session = newSessionContext(authedUserId);
             sessionStore.set(sessionId, session);
+            evictIfNeeded();
             isNewSession = true;
-            // Persist session immediately to avoid FK constraint violations
+            // Idempotent upsert: safe even if this session_id already exists in DB
+            // (e.g. the client reconnects after a server restart).
             await initializeSessionInDB(sessionId, session.userId, session.startTime);
             session.persisted = true;
         }
@@ -186,6 +273,18 @@ fastify.post('/chat', { preHandler: authPreHandlers }, async (request: Authentic
         const incomingQueryId = typeof query_id === 'string' && query_id.trim() ? query_id.trim() : null;
         let query: QueryContext | undefined = incomingQueryId ? session.queries.get(incomingQueryId) : undefined;
         let queryId: string;
+
+        // Restart/eviction recovery: if the client references a query we no longer
+        // hold in memory, rebuild its working state from the durable snapshot.
+        if (!query && incomingQueryId) {
+            const restored = await rehydrateQuery(sessionId, incomingQueryId);
+            if (restored) {
+                query = restored;
+                session.queries.set(incomingQueryId, restored);
+                session.queryOrder.push(incomingQueryId);
+                session.activeQueryId = incomingQueryId;
+            }
+        }
 
         if (!query) {
             queryId = randomSessionId();
@@ -618,6 +717,7 @@ fastify.post('/chat', { preHandler: authPreHandlers }, async (request: Authentic
         });
 
         await updateSessionMetricsRow(sessionId, session);
+        await persistQueryState(sessionId, session.userId, query);
 
         await recordRequestMetric({
             userId: session.userId,
@@ -644,11 +744,11 @@ fastify.post('/chat', { preHandler: authPreHandlers }, async (request: Authentic
         console.error('Message:', err.message);
         console.error('Stack:', err.stack);
         console.error('----------------------------------------');
-        return reply.code(500).send({
-            error: err.message || 'Internal Server Error',
-            details: err.stack,
-            hint: "Check server console for full logs"
-        });
+        // Never leak internals to clients in production.
+        const payload = config.isProd
+            ? { error: 'Internal Server Error' }
+            : { error: err.message || 'Internal Server Error', details: err.stack, hint: 'Check server console for full logs' };
+        return reply.code(500).send(payload);
     }
 });
 
@@ -656,9 +756,25 @@ fastify.get('/', async (request, reply) => {
     return { status: 'ok', message: 'Socratic AI Server Running' };
 });
 
-// Health check
+// Health check — verifies the DB is reachable so orchestrators can detect a
+// degraded instance rather than trusting a static "ok".
 fastify.get('/health', async (request, reply) => {
-    return { status: 'healthy', gemini: 'connected' };
+    const health: Record<string, unknown> = {
+        status: 'healthy',
+        env: config.nodeEnv,
+        gemini: config.gemini.apiKey ? 'configured' : 'missing',
+        whitelist: enableWhitelist ? 'enabled' : 'disabled',
+        sessions_in_memory: sessionStore.size
+    };
+    try {
+        await pool.query('SELECT 1');
+        health.db = 'connected';
+    } catch (e: any) {
+        health.db = 'error';
+        health.status = 'degraded';
+        return reply.code(503).send(health);
+    }
+    return health;
 });
 
 // Admin: add a user to the whitelist
@@ -722,6 +838,7 @@ fastify.post('/query/start', { preHandler: authPreHandlers }, async (request: Au
     if (!session) {
         session = newSessionContext(authedUserId);
         sessionStore.set(sessionId, session);
+        evictIfNeeded();
         isNewSession = true;
         await initializeSessionInDB(sessionId, session.userId, session.startTime);
         session.persisted = true;
@@ -732,6 +849,7 @@ fastify.post('/query/start', { preHandler: authPreHandlers }, async (request: Au
     session.queries.set(queryId, query);
     session.queryOrder.push(queryId);
     session.activeQueryId = queryId;
+    await persistQueryState(sessionId, session.userId, query);
 
     return {
         success: true,
@@ -825,26 +943,24 @@ async function finalizeQueryResolution(
     });
 
     await updateSessionMetricsRow(sessionId, session);
+    await persistQueryState(sessionId, session.userId, query);
     return summary;
 }
 
 async function initializeSessionInDB(sessionId: string, userId: string | null, startTime: string) {
     try {
-        await dbInsert('misconception_sessions', {
-            session_id: sessionId,
-            user_id: userId,
-            session_start_time: startTime,
-            session_end_time: null,
-            turn_count: 0,
-            direct_answer_pct: 0,
-            reasoning_pct: 0,
-            tokens_in: 0,
-            tokens_out: 0,
-            updated_at: new Date().toISOString()
-        });
+        await pool.query(
+            `INSERT INTO misconception_sessions
+                (session_id, user_id, session_start_time, session_end_time, turn_count,
+                 direct_answer_pct, reasoning_pct, tokens_in, tokens_out, updated_at)
+             VALUES ($1, $2, $3, NULL, 0, 0, 0, 0, 0, NOW())
+             ON CONFLICT (session_id) DO NOTHING`,
+            [sessionId, userId, startTime]
+        );
     } catch (error: any) {
+        // A genuine DB failure must still stop the request (query_turns FKs the session).
         console.error('Failed to initialize session in DB:', error?.message);
-        throw error; // Critical error - should not proceed
+        throw error;
     }
 }
 
@@ -1102,10 +1218,28 @@ function extractRelevantSnippet(code: string, misconceptionId: string): string {
     return '';
 }
 
+let shuttingDown = false;
+const shutdown = async (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`Received ${signal}; shutting down gracefully...`);
+    try {
+        await fastify.close();
+        await pool.end();
+        console.log('Shutdown complete.');
+        process.exit(0);
+    } catch (err) {
+        console.error('Error during shutdown:', err);
+        process.exit(1);
+    }
+};
+
 const start = async () => {
     try {
         // Fail fast in production if required secrets are missing; warn in dev.
         validateConfig();
+        process.on('SIGTERM', () => shutdown('SIGTERM'));
+        process.on('SIGINT', () => shutdown('SIGINT'));
         await fastify.listen({ port: config.port, host: config.host });
         console.log(`Server listening on http://${config.host}:${config.port}`);
         console.log(`Authentication ${enableWhitelist ? 'ENABLED' : 'DISABLED'} | env=${config.nodeEnv}`);

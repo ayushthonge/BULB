@@ -105,3 +105,18 @@ ALTER TABLE query_turns ADD COLUMN IF NOT EXISTS resolution_score NUMERIC(5,3);
 ALTER TABLE query_turns ADD COLUMN IF NOT EXISTS resolution_status TEXT;
 ALTER TABLE query_turns ADD COLUMN IF NOT EXISTS resolution_signals JSONB;
 CREATE INDEX IF NOT EXISTS idx_query_turns_resolution_status ON query_turns(resolution_status);
+
+-- ---------------------------------------------------------------------------
+-- Migration 003: durable working state for restart / cache-eviction recovery.
+-- Holds only the live pedagogical state per query (full transcripts stay in
+-- query_turns). Lets a redeploy resume in-flight conversations.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS query_state (
+    session_id TEXT NOT NULL,
+    query_id TEXT NOT NULL,
+    user_id TEXT,
+    state JSONB NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (session_id, query_id)
+);
+CREATE INDEX IF NOT EXISTS idx_query_state_updated ON query_state(updated_at);
