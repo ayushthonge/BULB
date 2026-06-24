@@ -12,8 +12,17 @@ declare global {
 const vscode = window.acquireVsCodeApi();
 const SERVER_URL = (window as any).__SERVER_URL__ || 'http://localhost:3000';
 
+function escapeHtml(s: string): string {
+    return s
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+}
+
 function renderMessage(text: string) {
-    const html = text
+    // Escape first (defense-in-depth: tutor text is server-controlled and guard-
+    // validated, but we never inject raw HTML), then apply the limited markdown.
+    const html = escapeHtml(text)
         .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
         .replace(/`([^`]+)`/g, '<code>$1</code>')
         .replace(/\n/g, '<br />');
@@ -32,6 +41,7 @@ export default function App() {
     const [sessionId, setSessionId] = useState<string>(() => generateSessionId());
     const [queryId, setQueryId] = useState<string | null>(null);
     const [isResolved, setIsResolved] = useState(false);
+    const [resolutionHint, setResolutionHint] = useState<{ action?: string; frustration?: boolean } | null>(null);
     const [connected, setConnected] = useState<boolean | null>(null);
     const turnIndexRef = useRef<number>(0);
     const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -114,6 +124,7 @@ export default function App() {
         setInput('');
         setLoading(true);
         setError(null);
+        setResolutionHint(null);
         turnIndexRef.current += 1;
 
         if (currentContext) {
@@ -155,6 +166,7 @@ export default function App() {
             }
             setMessages([]);
             setIsResolved(false);
+            setResolutionHint(null);
             turnIndexRef.current = 0;
         } catch (err: any) {
             console.error('Start query error:', err);
@@ -230,8 +242,16 @@ export default function App() {
             if (data.response?.text) {
                 setMessages(prev => [...prev, { role: 'assistant', parts: data.response.text, type: data.response.type }]);
                 setError(null);
-                if (data.response.type === 'resolution') {
+                if (data.response.type === 'resolution' || data.resolved) {
                     setIsResolved(true);
+                    setResolutionHint(null);
+                } else if (data.resolution) {
+                    // Surface a soft confirm / supportive affordance based on the
+                    // server's automatic resolution + frustration assessment.
+                    setResolutionHint({
+                        action: data.resolution.action,
+                        frustration: data.resolution.frustration
+                    });
                 }
             }
         } catch (err: any) {
@@ -274,6 +294,7 @@ export default function App() {
                 setMessages(prev => [...prev, { role: 'assistant', parts: data.response.text, type: data.response.type }]);
             }
             setIsResolved(true);
+            setResolutionHint(null);
         } catch (err: any) {
             console.error('Resolve error:', err);
             const errorMsg = err.status
@@ -348,6 +369,21 @@ export default function App() {
                 )}
                 <div ref={messagesEndRef} />
             </div>
+
+            {!isResolved && resolutionHint?.action === 'confirm_resolution' && (
+                <div className="resolution-banner">
+                    <span>Sounds like you’ve worked it out. Mark this query resolved?</span>
+                    <button onClick={handleResolve} disabled={loading} className="resolution-banner-btn">
+                        I’ve got it
+                    </button>
+                </div>
+            )}
+            {!isResolved && resolutionHint?.frustration && (
+                <div className="frustration-banner">
+                    Stuck is part of learning. Try the smallest version of the problem, or reach out to your
+                    instructor — I’ll keep helping you reason it through.
+                </div>
+            )}
 
             <div className="input-container">
                 <textarea

@@ -326,3 +326,47 @@ body {
   opacity: 0.4;
   cursor: not-allowed;
 }
+
+/* Resolution / frustration affordances */
+.resolution-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 16px;
+  background: var(--vscode-testing-iconPassed, #12321c);
+  border-top: 1px solid var(--vscode-panel-border, #2b2b2b);
+  color: var(--text-primary);
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.resolution-banner-btn {
+  padding: 4px 10px;
+  font-size: 11px;
+  background: var(--accent-blue);
+  border: 1px solid var(--accent-blue);
+  border-radius: 3px;
+  color: white;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.resolution-banner-btn:hover:not(:disabled) {
+  background: var(--accent-blue-hover);
+}
+
+.resolution-banner-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.frustration-banner {
+  padding: 8px 16px;
+  background: var(--vscode-inputValidation-warningBackground, #352a05);
+  border-top: 1px solid var(--vscode-inputValidation-warningBorder, #966c0e);
+  color: var(--text-primary);
+  font-size: 12px;
+  line-height: 1.5;
+  flex-shrink: 0;
+}
