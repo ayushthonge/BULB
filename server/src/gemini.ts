@@ -4,20 +4,21 @@ import {
     MISCONCEPTION_TAXONOMY,
     MisconceptionVerdict,
     Strategy,
-    hardValidateQuestion,
     fallbackQuestion
 } from './misconceptions';
+import { config } from './config';
+import { validateSocraticQuestion, correctiveInstruction } from './guards/outputGuard';
 
-const hasGeminiKey = !!process.env.GEMINI_API_KEY;
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
+const hasGeminiKey = !!config.gemini.apiKey;
+const genAI = new GoogleGenerativeAI(config.gemini.apiKey);
 
 // Separate models so classifier is not influenced by generator system prompts.
 const classifierModel = genAI.getGenerativeModel({
-    model: 'gemini-2.5-flash-lite'
+    model: config.gemini.classifierModel
 });
 
 const generatorModel = genAI.getGenerativeModel({
-    model: 'gemini-2.5-flash-lite',
+    model: config.gemini.generatorModel,
     systemInstruction: 'You are a strict Socratic tutor. Output exactly one short question. Never explain, never answer.'
 });
 
@@ -160,7 +161,7 @@ user_message_untrusted: ${params.userMessage}`;
     const result = await classifierModel.generateContent({
         contents: [{ role: 'user', parts: [{ text: prompt }] }],
         generationConfig: {
-            maxOutputTokens: 512,
+            maxOutputTokens: config.gemini.classifierMaxTokens,
             responseMimeType: 'application/json'
         }
     });
@@ -238,22 +239,32 @@ Do NOT provide the answer. Ask a single, stronger hint question per the hint lev
 
 Respond with the single progressive question only.`;
 
-    const retries = params.retries ?? 2;
+    const retries = params.retries ?? config.gemini.generatorRetries;
+    let activePrompt = prompt;
     for (let attempt = 1; attempt <= retries; attempt++) {
         try {
             const result = await generatorModel.generateContent({
-                contents: [{ role: 'user', parts: [{ text: prompt }] }],
-                generationConfig: { maxOutputTokens: 80 }
+                contents: [{ role: 'user', parts: [{ text: activePrompt }] }],
+                generationConfig: { maxOutputTokens: config.gemini.generatorMaxTokens }
             });
 
             const question = sanitizeToSingleQuestion(result.response.text());
-            const { valid, reason } = hardValidateQuestion(question, params.lastQuestion, hintLevel);
+            const validation = validateSocraticQuestion(question, {
+                previousQuestion: params.lastQuestion,
+                hintLevel
+            });
 
-            if (valid) {
+            if (validation.valid) {
                 return { question, usage: extractUsage(result.response?.usageMetadata) };
             }
 
-            console.warn('Question validation failed:', reason, 'raw:', question);
+            // Steer the next attempt away from the exact violation instead of
+            // blindly retrying the same prompt.
+            console.warn('[generator] rejected:', validation.violations.join(','), 'raw:', question);
+            const corrective = correctiveInstruction(validation.violations);
+            if (corrective) {
+                activePrompt = prompt + '\n\n' + corrective;
+            }
         } catch (error: any) {
             const is503 = error.message?.includes('503') || error.message?.includes('overloaded');
             if (is503 && attempt < retries) {
@@ -272,7 +283,7 @@ Respond with the single progressive question only.`;
 }
 
 export async function generateCodeContextSummary(code: string): Promise<string> {
-    const MAX_INPUT = 8000;
+    const MAX_INPUT = config.context.summaryMaxInput;
     const truncated = code.length > MAX_INPUT ? code.slice(0, MAX_INPUT) + '\n... [truncated]' : code;
 
     const prompt = `You are a code analysis assistant for a Socratic programming tutor. Analyze this student's code and produce a structured summary that the tutor will use to ask targeted questions.
@@ -293,7 +304,7 @@ Output only the structured summary, no preamble.`;
     try {
         const result = await classifierModel.generateContent({
             contents: [{ role: 'user', parts: [{ text: prompt }] }],
-            generationConfig: { maxOutputTokens: 350 }
+            generationConfig: { maxOutputTokens: config.gemini.summaryMaxTokens }
         });
 
         let summary = result.response.text().trim();

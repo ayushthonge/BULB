@@ -35,6 +35,8 @@ import {
     randomSessionId
 } from './misconceptions';
 import { dbInsert, dbUpdate, pool } from './db';
+import { inspectUserInput } from './guards/inputGuard';
+import { config, validateConfig } from './config';
 import crypto from 'crypto';
 
 type CodeContext = {
@@ -249,6 +251,69 @@ fastify.post('/chat', { preHandler: authPreHandlers }, async (request: Authentic
         const { intent, confidence, messageIntent } = inferIntentAndConfidence(sanitizedMessage, query.state.learnerConfidence);
         query.state.learnerConfidence = confidence;
         query.intentCounts[messageIntent] = (query.intentCounts[messageIntent] || 0) + 1;
+
+        // Input guard: deterministically block tutor-subversion attempts
+        // (prompt injection, jailbreak, system-prompt probing) BEFORE spending
+        // any model tokens. Ordinary "just tell me" frustration is NOT blocked
+        // here — it flows through and is handled pedagogically downstream.
+        const guardResult = inspectUserInput(sanitizedMessage);
+        if (guardResult.blocked) {
+            const guardResponse = guardResult.response ||
+                "Let's keep working through your code. What are you trying to do, and what happens instead?";
+            query.turns.push({ role: 'user', parts: sanitizedMessage });
+            query.turns.push({ role: 'assistant', parts: guardResponse, type: 'question' });
+
+            await logTurn({
+                sessionId, queryId,
+                turnIndex: query.state.turnIndex,
+                userMessage: sanitizedMessage,
+                fileContext: codeContextRef?.id || null,
+                question: guardResponse,
+                targeted: null,
+                classifierCertainty: 0,
+                rawVerdicts: [],
+                deltas: {},
+                resolutions: [],
+                confidenceBefore: null,
+                confidenceAfter: null,
+                resolved: false,
+                resolutionSource: null,
+                intent: messageIntent,
+                strategy: `input_guard:${guardResult.category}`,
+                hintLevel: query.hintLevel,
+                learnerConfidence: query.state.learnerConfidence,
+                tokensIn: 0, tokensOut: 0
+            });
+
+            await recordRequestMetric({
+                userId: session.userId,
+                path: '/chat',
+                statusCode: 200,
+                latencyMs: Date.now() - reqStart,
+                tokensIn: 0, tokensOut: 0,
+                modelStatus: `input_guard_block:${guardResult.category}`
+            });
+
+            return {
+                response: { type: 'question', text: guardResponse },
+                session_id: sessionId,
+                query_id: queryId,
+                context_id: codeContextRef?.id || null,
+                context_hash: codeContextRef?.hash || null,
+                context_changed: contextChanged,
+                targeted_misconception: null,
+                classifier_certainty: 0,
+                deltas: {},
+                resolution_events: [],
+                state: snapshotState(query.state),
+                tokens_in: 0, tokens_out: 0,
+                intent: messageIntent,
+                confidence_before: null, confidence_after: null,
+                resolved: false,
+                guard: { blocked: true, category: guardResult.category },
+                is_new_session: isNewSession
+            };
+        }
 
         // Off-topic: redirect without burning an LLM call
         if (messageIntent === 'off_topic') {
@@ -893,10 +958,11 @@ function extractRelevantSnippet(code: string, misconceptionId: string): string {
 
 const start = async () => {
     try {
-        const port = parseInt(process.env.PORT || '3000');
-        await fastify.listen({ port, host: '0.0.0.0' });
-        console.log(`Server listening on http://0.0.0.0:${port}`);
-        console.log(`Authentication ${enableWhitelist ? 'ENABLED' : 'DISABLED'}`);
+        // Fail fast in production if required secrets are missing; warn in dev.
+        validateConfig();
+        await fastify.listen({ port: config.port, host: config.host });
+        console.log(`Server listening on http://${config.host}:${config.port}`);
+        console.log(`Authentication ${enableWhitelist ? 'ENABLED' : 'DISABLED'} | env=${config.nodeEnv}`);
     } catch (err) {
         fastify.log.error(err);
         process.exit(1);

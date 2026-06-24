@@ -1,4 +1,6 @@
 import crypto from 'crypto';
+import { config } from './config';
+import { validateSocraticQuestion } from './guards/outputGuard';
 
 export type MisconceptionId =
     | 'off-by-one'
@@ -140,11 +142,13 @@ export const MISCONCEPTION_TAXONOMY: { id: MisconceptionId; label: string; descr
 
 const CLAMP = (n: number) => Math.min(1, Math.max(0, n));
 
-export const NEUTRAL_CONFIDENCE = 0.32;
-const DELTA_UP = 0.22;
-const DELTA_DOWN = 0.18;
-const DECAY = 0.9;
-const RESOLUTION_THRESHOLD = 0.18;
+// Pedagogical thresholds are owned by config.ts (env-overridable) so the values
+// reported in the paper stay in sync with what actually runs. See docs/PLAN.md §4.
+export const NEUTRAL_CONFIDENCE = config.thresholds.neutralConfidence;
+const DELTA_UP = config.thresholds.deltaUp;
+const DELTA_DOWN = config.thresholds.deltaDown;
+const DECAY = config.thresholds.decay;
+const RESOLUTION_THRESHOLD = config.thresholds.resolutionThreshold;
 
 export function createSessionState(): MisconceptionState {
     return {
@@ -383,54 +387,19 @@ export function sanitizeUserInput(input: string) {
         .trim();
 }
 
+/**
+ * Back-compat wrapper. The canonical Socratic output validation now lives in
+ * guards/outputGuard.ts; this delegates so existing callers keep working.
+ */
 export function hardValidateQuestion(
     question: string,
     previousQuestion?: string | null,
     hintLevel?: number
 ) {
-    const level = hintLevel ?? 1;
-
-    // Dynamic length limit based on hint level
-    const maxChars = level === 1 ? 100 : level === 2 ? 130 : 160;
-    const maxWords = 25;
-
-    const wordCount = question.split(/\s+/).filter(Boolean).length;
-    const multipleQuestions = (question.match(/\?/g) || []).length > 1;
-    // Only reject actual code blocks or HTML tags, not the word "class" in isolation
-    const hasCode = /```|<[^>]+>/.test(question);
-    const hasSteps = /step\s+\d|first,|second,|third,/i.test(question);
-    const tooLong = question.length > maxChars;
-    const tooManyWords = wordCount > maxWords;
-    const hasExplanation = /because|for example|you should/i.test(question);
-
-    let isSameAsPrevious = false;
-    if (previousQuestion) {
-        const normalizedCurrent = question.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
-        const normalizedPrevious = previousQuestion.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
-
-        if (normalizedCurrent === normalizedPrevious) {
-            isSameAsPrevious = true;
-        } else {
-            const currentWords = new Set(normalizedCurrent.split(/\s+/));
-            const previousWords = new Set(normalizedPrevious.split(/\s+/));
-            const intersection = new Set([...currentWords].filter(w => previousWords.has(w)));
-            const similarity = intersection.size / Math.max(currentWords.size, previousWords.size);
-            if (similarity > 0.68) {
-                isSameAsPrevious = true;
-            }
-        }
-    }
-
-    const valid = !multipleQuestions && !hasCode && !hasSteps && !tooLong && !tooManyWords && !hasExplanation && !isSameAsPrevious;
-
-    let reason: string | null = null;
-    if (!valid) {
-        if (isSameAsPrevious) reason = 'Question too similar to previous';
-        else if (tooLong) reason = `Question exceeds ${maxChars} chars for hint level ${level}`;
-        else if (tooManyWords) reason = `Question exceeds ${maxWords} words`;
-        else reason = 'Question validation failed (multiple questions / code / steps / explanation)';
-    }
-
+    const { valid, reason } = validateSocraticQuestion(question, {
+        previousQuestion,
+        hintLevel,
+    });
     return { valid, reason };
 }
 
