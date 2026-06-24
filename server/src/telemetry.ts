@@ -1,4 +1,4 @@
-import { supabase } from './supabase';
+import { dbInsert } from './db';
 
 export type RequestMetric = {
     userId?: string | null;
@@ -11,10 +11,9 @@ export type RequestMetric = {
     modelError?: string;
 };
 
-// Structured log to Supabase; avoid storing raw student code.
 export async function recordRequestMetric(metric: RequestMetric) {
     try {
-        await supabase.from('request_metrics').insert({
+        await dbInsert('request_metrics', {
             user_id: metric.userId ?? null,
             path: metric.path,
             status_code: metric.statusCode,

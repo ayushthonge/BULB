@@ -2,7 +2,7 @@
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import dotenv from 'dotenv';
-import { authenticate, AuthenticatedRequest } from './auth';
+import { authenticate, requireAdmin, AuthenticatedRequest } from './auth';
 import { rateLimit } from './rateLimit';
 import { recordRequestMetric } from './telemetry';
 
@@ -13,11 +13,13 @@ const fastify = Fastify({
     bodyLimit: 256 * 1024 // cap payload size to ~256KB to avoid oversized context uploads
 });
 
+const enableWhitelist = process.env.ENABLE_WHITELIST !== 'false';
+const authPreHandlers = enableWhitelist ? [authenticate, rateLimit] : [rateLimit];
+
 fastify.register(cors, {
     origin: process.env.CORS_ORIGIN || '*'
 });
 
-import { register, metrics } from './metrics';
 import { classifyMisconceptions, generateSocraticQuestion, generateCodeContextSummary } from './gemini';
 import {
     applyVerdicts,
@@ -27,11 +29,12 @@ import {
     MessageIntent,
     NEUTRAL_CONFIDENCE,
     pickTopMisconception,
+    pickTopMisconceptions,
     sanitizeUserInput,
     snapshotState,
     randomSessionId
 } from './misconceptions';
-import { supabase } from './supabase';
+import { dbInsert, dbUpdate, pool } from './db';
 import crypto from 'crypto';
 
 type CodeContext = {
@@ -90,6 +93,7 @@ type QueryContext = {
 };
 
 const MAX_CONTEXT_CHARS = 24000; // reasonable cap: allows medium files but blocks very large payloads
+const MAX_CONTEXT_LINES = 60; // hard limit: students should focus on small, targeted code snippets
 
 const newSessionContext = (userId?: string | null): SessionContext => ({
     startTime: new Date().toISOString(),
@@ -114,7 +118,8 @@ const newQueryContext = (id: string): QueryContext => ({
         solution_request: 0,
         debugging: 0,
         conceptual: 0,
-        clarification: 0
+        clarification: 0,
+        off_topic: 0
     },
     turnCount: 0,
     directAnswerCount: 0,
@@ -129,15 +134,8 @@ const newQueryContext = (id: string): QueryContext => ({
 
 const sessionStore = new Map<string, SessionContext>();
 
-// Metrics Endpoint (no auth for testing)
-fastify.get('/metrics', async (request, reply) => {
-    const metrics = await register.metrics();
-    reply.header('Content-Type', register.contentType);
-    return metrics;
-});
-
 // Chat Endpoint implementing misconception classifier pipeline
-fastify.post('/chat', { preHandler: [authenticate, rateLimit] }, async (request: AuthenticatedRequest & any, reply) => {
+fastify.post('/chat', { preHandler: authPreHandlers }, async (request: AuthenticatedRequest & any, reply) => {
     const reqStart = Date.now();
     try {
         const { message, history = [], context = '', context_id, context_hash, session_id, query_id, turn_index, user_id } = request.body || {};
@@ -151,6 +149,17 @@ fastify.post('/chat', { preHandler: [authenticate, rateLimit] }, async (request:
             return reply.code(413).send({ error: `Context too large. Limit ${MAX_CONTEXT_CHARS} characters.` });
         }
 
+        if (context && typeof context === 'string') {
+            const lineCount = context.split('\n').length;
+            if (lineCount > MAX_CONTEXT_LINES) {
+                return reply.code(413).send({
+                    error: `Code context exceeds ${MAX_CONTEXT_LINES} lines (got ${lineCount}). Select a smaller portion of code to focus on.`,
+                    line_count: lineCount,
+                    max_lines: MAX_CONTEXT_LINES
+                });
+            }
+        }
+
         const sessionId = session_id || randomSessionId();
         let session = sessionStore.get(sessionId);
         let isNewSession = false;
@@ -161,7 +170,6 @@ fastify.post('/chat', { preHandler: [authenticate, rateLimit] }, async (request:
             // Persist session immediately to avoid FK constraint violations
             await initializeSessionInDB(sessionId, session.userId, session.startTime);
             session.persisted = true;
-            metrics.activeSessions.inc();
         }
 
         session.userId = authedUserId ?? session.userId;
@@ -191,10 +199,11 @@ fastify.post('/chat', { preHandler: [authenticate, rateLimit] }, async (request:
         let contextChanged = false;
 
         if (context && typeof context === 'string' && context.trim()) {
-            const receivedHash = context_hash || crypto.createHash('md5').update(context).digest('hex');
+            // Always compute server-side MD5, ignore client hash for cache matching
+            const serverHash = crypto.createHash('md5').update(context).digest('hex');
             const existingContext = context_id ? session.codeContexts.get(context_id) : null;
 
-            if (!existingContext || existingContext.hash !== receivedHash) {
+            if (!existingContext || existingContext.hash !== serverHash) {
                 // New or changed context - generate summary
                 contextChanged = true;
                 const contextId = context_id || randomSessionId();
@@ -203,7 +212,7 @@ fastify.post('/chat', { preHandler: [authenticate, rateLimit] }, async (request:
 
                 codeContextRef = {
                     id: contextId,
-                    hash: receivedHash,
+                    hash: serverHash,
                     fullCode: context,
                     summary,
                     symbols,
@@ -240,7 +249,64 @@ fastify.post('/chat', { preHandler: [authenticate, rateLimit] }, async (request:
         const { intent, confidence, messageIntent } = inferIntentAndConfidence(sanitizedMessage, query.state.learnerConfidence);
         query.state.learnerConfidence = confidence;
         query.intentCounts[messageIntent] = (query.intentCounts[messageIntent] || 0) + 1;
-        
+
+        // Off-topic: redirect without burning an LLM call
+        if (messageIntent === 'off_topic') {
+            const offTopicResponse = "I'm here to help you understand your code through questions. Can you tell me what part of your code you're working on or what concept you're struggling with?";
+            query.turns.push({ role: 'user', parts: sanitizedMessage });
+            query.turns.push({ role: 'assistant', parts: offTopicResponse, type: 'question' });
+
+            await logTurn({
+                sessionId, queryId,
+                turnIndex: query.state.turnIndex,
+                userMessage: sanitizedMessage,
+                fileContext: codeContextRef?.id || null,
+                question: offTopicResponse,
+                targeted: null,
+                classifierCertainty: 0,
+                rawVerdicts: [],
+                deltas: {},
+                resolutions: [],
+                confidenceBefore: null,
+                confidenceAfter: null,
+                resolved: false,
+                resolutionSource: null,
+                intent: messageIntent,
+                strategy: null,
+                hintLevel: query.hintLevel,
+                learnerConfidence: query.state.learnerConfidence,
+                tokensIn: 0, tokensOut: 0
+            });
+
+            await recordRequestMetric({
+                userId: session.userId,
+                path: '/chat',
+                statusCode: 200,
+                latencyMs: Date.now() - reqStart,
+                tokensIn: 0, tokensOut: 0,
+                modelStatus: 'off_topic_skip'
+            });
+
+            return {
+                response: { type: 'question', text: offTopicResponse },
+                session_id: sessionId,
+                query_id: queryId,
+                context_id: codeContextRef?.id || null,
+                context_hash: codeContextRef?.hash || null,
+                context_changed: contextChanged,
+                targeted_misconception: null,
+                classifier_certainty: 0,
+                deltas: {},
+                resolution_events: [],
+                state: snapshotState(query.state),
+                tokens_in: 0, tokens_out: 0,
+                intent: messageIntent,
+                confidence_before: null, confidence_after: null,
+                resolved: false,
+                is_new_session: isNewSession
+            };
+        }
+
         // Direct answer seeking
         if (messageIntent === 'solution_request') {
             query.directAnswerCount += 1;
@@ -253,7 +319,7 @@ fastify.post('/chat', { preHandler: [authenticate, rateLimit] }, async (request:
         const preUpdateMap = new Map(query.state.map);
 
         // Classifier receives summary only (or full code if context just changed)
-        const classifierContext = codeContextRef 
+        const classifierContext = codeContextRef
             ? (contextChanged ? codeContextRef.fullCode : codeContextRef.summary)
             : null;
 
@@ -265,15 +331,23 @@ fastify.post('/chat', { preHandler: [authenticate, rateLimit] }, async (request:
 
         const update = applyVerdicts(query.state, verdicts);
         const top = pickTopMisconception(query.state);
-        const strategy = chooseStrategy(intent, query.state.learnerConfidence, top?.confidence ?? null);
+        const topTwo = pickTopMisconceptions(query.state, 2, 0.5);
+        const strategy = chooseStrategy(intent, messageIntent, top?.id ?? null);
 
-        // Generator receives summary + relevant snippet
-        const generatorContext = codeContextRef
-            ? codeContextRef.summary + (top?.id ? extractRelevantSnippet(codeContextRef.fullCode, top.id) : '')
-            : null;
+        // Generator receives summary + relevant snippets for up to 2 misconceptions
+        let generatorContext: string | null = null;
+        if (codeContextRef) {
+            let ctx = codeContextRef.summary;
+            for (const m of topTwo) {
+                const snippet = extractRelevantSnippet(codeContextRef.fullCode, m.id);
+                if (snippet) ctx += '\n' + snippet;
+            }
+            generatorContext = ctx;
+        }
 
         const { question, usage: generatorUsage } = await generateSocraticQuestion({
             targetedMisconception: top?.id || null,
+            secondaryMisconception: topTwo.length > 1 ? topTwo[1].id : null,
             strategy,
             userMessage: sanitizedMessage,
             fileContext: generatorContext ?? undefined,
@@ -282,7 +356,7 @@ fastify.post('/chat', { preHandler: [authenticate, rateLimit] }, async (request:
         });
 
         query.state.lastQuestion = question;
-        query.hintLevel = Math.min(query.hintLevel + 1, 5);
+        query.hintLevel = Math.min(query.hintLevel + 1, 3);
 
         query.turnCount = query.state.turnIndex;
         // Don't auto-update endTime on every turn; only when session explicitly ends
@@ -311,7 +385,7 @@ fastify.post('/chat', { preHandler: [authenticate, rateLimit] }, async (request:
             confidenceAfter,
             resolved
         });
-        
+
         // Append to history for the caller (extension keeps its own copy)
         const responsePayload = {
             response: {
@@ -346,12 +420,17 @@ fastify.post('/chat', { preHandler: [authenticate, rateLimit] }, async (request:
             question,
             targeted,
             classifierCertainty,
+            rawVerdicts: verdicts,
             deltas: update.deltas,
             resolutions: update.resolutionEvents,
             confidenceBefore,
             confidenceAfter,
             resolved,
+            resolutionSource: resolved ? 'auto_threshold' : null,
             intent: messageIntent,
+            strategy,
+            hintLevel: query.hintLevel,
+            learnerConfidence: query.state.learnerConfidence,
             tokensIn,
             tokensOut
         });
@@ -400,8 +479,33 @@ fastify.get('/health', async (request, reply) => {
     return { status: 'healthy', gemini: 'connected' };
 });
 
+// Admin: add a user to the whitelist
+fastify.post('/admin/whitelist/add', { preHandler: [authenticate, requireAdmin] }, async (request: AuthenticatedRequest & any, reply) => {
+    const { email, role } = request.body || {};
+    if (!email || typeof email !== 'string' || !email.includes('@')) {
+        return reply.code(400).send({ error: 'Valid email required' });
+    }
+    const userRole = role === 'admin' ? 'admin' : 'student';
+    const token = crypto.randomBytes(16).toString('hex');
+    try {
+        await dbInsert('whitelist_users', { email: email.toLowerCase().trim(), token, role: userRole, active: true });
+        return { success: true, email, token, role: userRole };
+    } catch (err: any) {
+        if (err.message?.includes('duplicate')) {
+            return reply.code(409).send({ error: 'Email already exists' });
+        }
+        throw err;
+    }
+});
+
+// Admin: list whitelisted users (no tokens exposed)
+fastify.get('/admin/whitelist/list', { preHandler: [authenticate, requireAdmin] }, async (request: AuthenticatedRequest & any, reply) => {
+    const result = await pool.query('SELECT email, role, active, created_at FROM whitelist_users ORDER BY created_at DESC');
+    return { users: result.rows };
+});
+
 // End session explicitly
-fastify.post('/session/end', { preHandler: [authenticate, rateLimit] }, async (request: AuthenticatedRequest & any, reply) => {
+fastify.post('/session/end', { preHandler: authPreHandlers }, async (request: AuthenticatedRequest & any, reply) => {
     const { session_id } = request.body;
     if (!session_id) {
         return reply.code(400).send({ error: 'Missing session_id' });
@@ -415,25 +519,19 @@ fastify.post('/session/end', { preHandler: [authenticate, rateLimit] }, async (r
     const endTime = new Date().toISOString();
     session.endTime = endTime;
 
-    const aggregates = aggregateSessionStats(session);
-    if (aggregates.turnCount <= 1) {
-        metrics.dropOffRate.inc();
-    }
-
     await updateSessionMetricsRow(session_id, session, endTime);
 
     // Optionally remove from memory
     sessionStore.delete(session_id);
-    metrics.activeSessions.dec();
 
-    return { 
-        success: true, 
+    return {
+        success: true,
         session_id
     };
 });
 
 // Start a new query within a session
-fastify.post('/query/start', { preHandler: [authenticate, rateLimit] }, async (request: AuthenticatedRequest & any, reply) => {
+fastify.post('/query/start', { preHandler: authPreHandlers }, async (request: AuthenticatedRequest & any, reply) => {
     const { session_id, user_id } = request.body || {};
     const authedUserId = request.user?.id || user_id || null;
     const sessionId = session_id || randomSessionId();
@@ -445,7 +543,6 @@ fastify.post('/query/start', { preHandler: [authenticate, rateLimit] }, async (r
         isNewSession = true;
         await initializeSessionInDB(sessionId, session.userId, session.startTime);
         session.persisted = true;
-        metrics.activeSessions.inc();
     }
 
     const queryId = randomSessionId();
@@ -463,7 +560,7 @@ fastify.post('/query/start', { preHandler: [authenticate, rateLimit] }, async (r
 });
 
 // Explicit user-driven query resolution endpoint
-fastify.post('/query/resolve', { preHandler: [authenticate, rateLimit] }, async (request: AuthenticatedRequest & any, reply) => {
+fastify.post('/query/resolve', { preHandler: authPreHandlers }, async (request: AuthenticatedRequest & any, reply) => {
     const { session_id, query_id } = request.body || {};
     if (!session_id) {
         return reply.code(400).send({ error: 'Missing session_id' });
@@ -500,12 +597,6 @@ fastify.post('/query/resolve', { preHandler: [authenticate, rateLimit] }, async 
     query.resolved = true;
     query.resolvedAt = endTime;
 
-    metrics.resolutionClicks.inc();
-    metrics.resolutionTurns.observe(query.turnCount);
-    metrics.avgTurnsPerSession.observe(query.turnCount);
-    const elapsedSeconds = Math.max(1, Math.round((Date.parse(endTime) - Date.parse(query.startTime)) / 1000));
-    metrics.resolutionLatencySeconds.observe(elapsedSeconds);
-
     const summary = buildQuerySummary({
         sessionId: session_id,
         userId: session.userId,
@@ -536,7 +627,7 @@ fastify.post('/query/resolve', { preHandler: [authenticate, rateLimit] }, async 
 
 async function initializeSessionInDB(sessionId: string, userId: string | null, startTime: string) {
     try {
-        await supabase.from('misconception_sessions').insert({
+        await dbInsert('misconception_sessions', {
             session_id: sessionId,
             user_id: userId,
             session_start_time: startTime,
@@ -558,35 +649,54 @@ function aggregateSessionStats(session: SessionContext) {
     let turnCount = 0;
     let directAnswers = 0;
     let reasoning = 0;
+    let offTopicCount = 0;
     let tokensIn = 0;
     let tokensOut = 0;
+    let misconceptionsResolved = 0;
+    let misconceptionsActive = 0;
 
     session.queries.forEach(q => {
         turnCount += q.turnCount;
         directAnswers += q.directAnswerCount;
         reasoning += q.reasoningCount;
+        offTopicCount += q.intentCounts.off_topic || 0;
         tokensIn += q.tokensIn;
         tokensOut += q.tokensOut;
+
+        // Count resolved misconceptions from timeline
+        const resolvedSet = new Set<string>();
+        q.misconceptionTimeline.forEach(entry => {
+            if (entry.resolved && entry.targeted) {
+                resolvedSet.add(entry.targeted);
+            }
+        });
+        misconceptionsResolved += resolvedSet.size;
+
+        // Active misconceptions still in state map
+        misconceptionsActive += q.state.map.size;
     });
 
     const directPct = turnCount > 0 ? Math.round((directAnswers / turnCount) * 100 * 100) / 100 : 0;
     const reasoningPct = turnCount > 0 ? Math.round((reasoning / turnCount) * 100 * 100) / 100 : 0;
 
-    return { turnCount, directPct, reasoningPct, tokensIn, tokensOut };
+    return { turnCount, directPct, reasoningPct, offTopicCount, tokensIn, tokensOut, misconceptionsResolved, misconceptionsActive };
 }
 
 async function updateSessionMetricsRow(sessionId: string, session: SessionContext, endTimeOverride?: string) {
     try {
         const aggregates = aggregateSessionStats(session);
-        await supabase.from('misconception_sessions').update({
+        await dbUpdate('misconception_sessions', {
             turn_count: aggregates.turnCount,
             direct_answer_pct: aggregates.directPct,
             reasoning_pct: aggregates.reasoningPct,
+            off_topic_count: aggregates.offTopicCount,
+            misconceptions_resolved: aggregates.misconceptionsResolved,
+            misconceptions_active: aggregates.misconceptionsActive,
             tokens_in: aggregates.tokensIn,
             tokens_out: aggregates.tokensOut,
             session_end_time: endTimeOverride || session.endTime,
             updated_at: new Date().toISOString()
-        }).eq('session_id', sessionId);
+        }, { session_id: sessionId });
     } catch (error: any) {
         console.warn('Session metrics update failed', error?.message);
     }
@@ -601,17 +711,22 @@ async function logTurn(params: {
     question: string;
     targeted: string | null;
     classifierCertainty: number;
+    rawVerdicts: any[];
     deltas: Record<string, number>;
     resolutions: string[];
     confidenceBefore: number | null;
     confidenceAfter: number | null;
     resolved: boolean;
+    resolutionSource: string | null;
     intent: MessageIntent;
+    strategy: string | null;
+    hintLevel: number;
+    learnerConfidence: number;
     tokensIn: number;
     tokensOut: number;
 }) {
     try {
-        await supabase.from('query_turns').insert({
+        await dbInsert('query_turns', {
             session_id: params.sessionId,
             query_id: params.queryId,
             turn_index: params.turnIndex,
@@ -620,19 +735,24 @@ async function logTurn(params: {
             question: params.question,
             targeted_misconception: params.targeted,
             classifier_certainty: params.classifierCertainty,
-            confidence_deltas: params.deltas,
-            resolution_events: params.resolutions,
+            raw_verdicts: JSON.stringify(params.rawVerdicts),
+            confidence_deltas: JSON.stringify(params.deltas),
+            resolution_events: JSON.stringify(params.resolutions),
             misconception_confidence_before: params.confidenceBefore,
             misconception_confidence_after: params.confidenceAfter,
             misconception_resolved: params.resolved,
+            resolution_source: params.resolutionSource,
             intent: params.intent,
+            strategy: params.strategy,
+            hint_level: params.hintLevel,
+            learner_confidence: params.learnerConfidence,
             tokens_in: params.tokensIn,
             tokens_out: params.tokensOut,
             created_at: new Date().toISOString()
         });
     } catch (error: any) {
         // Non-blocking log failure
-        console.warn('Supabase log failed', error?.message);
+        console.warn('Turn log failed', error?.message);
     }
 }
 
@@ -650,6 +770,15 @@ function buildQuerySummary(params: {
         .map((t, i) => ({ index: i + 1, role: t.role, text: t.parts, type: t.type }))
         .slice(0, 6);
 
+    // Compute misconception resolution stats
+    const autoResolved = new Set<string>();
+    const allTargeted = new Set<string>();
+    query.misconceptionTimeline.forEach(entry => {
+        if (entry.targeted) allTargeted.add(entry.targeted);
+        if (entry.resolved && entry.targeted) autoResolved.add(entry.targeted);
+    });
+    const stillActive = Array.from(query.state.map.entries()).map(([id, conf]) => ({ id, confidence: conf }));
+
     return {
         session_id: params.sessionId,
         query_id: query.id,
@@ -661,9 +790,18 @@ function buildQuerySummary(params: {
             turn_count: query.turnCount,
             direct_answer_pct: query.turnCount > 0 ? Math.round((query.directAnswerCount / query.turnCount) * 100 * 100) / 100 : 0,
             reasoning_pct: query.turnCount > 0 ? Math.round((query.reasoningCount / query.turnCount) * 100 * 100) / 100 : 0,
+            off_topic_count: query.intentCounts.off_topic || 0,
             tokens_in: query.tokensIn,
             tokens_out: query.tokensOut,
             duration_seconds: durationSeconds
+        },
+        misconception_resolution: {
+            total_targeted: allTargeted.size,
+            auto_resolved: Array.from(autoResolved),
+            still_active: stillActive,
+            resolution_rate: allTargeted.size > 0
+                ? Math.round((autoResolved.size / allTargeted.size) * 100) / 100
+                : null
         },
         resolution_label: 'resolved_by_user',
         resolved_at: query.resolvedAt
@@ -677,21 +815,21 @@ async function logQuerySummaryTrainingData(params: {
     summary: Record<string, unknown>;
 }) {
     try {
-        await supabase.from('query_summaries').insert({
+        await dbInsert('query_summaries', {
             session_id: params.sessionId,
             query_id: params.query.id,
             user_id: params.userId,
-            summary: params.summary,
+            summary: JSON.stringify(params.summary),
             created_at: new Date().toISOString()
         });
 
-        await supabase.from('query_training_data').insert({
+        await dbInsert('query_training_data', {
             session_id: params.sessionId,
             query_id: params.query.id,
             user_id: params.userId,
             label: 'resolved_by_user',
-            history: params.query.turns,
-            summary: params.summary,
+            history: JSON.stringify(params.query.turns),
+            summary: JSON.stringify(params.summary),
             created_at: new Date().toISOString()
         });
     } catch (error: any) {
@@ -703,7 +841,7 @@ function extractSymbols(code: string): string[] {
     const symbols: string[] = [];
     const functionRegex = /(?:function|const|let|var)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*[=\(]/g;
     const classRegex = /class\s+([a-zA-Z_$][a-zA-Z0-9_$]*)/g;
-    
+
     let match;
     while ((match = functionRegex.exec(code)) !== null) {
         symbols.push(match[1]);
@@ -711,12 +849,11 @@ function extractSymbols(code: string): string[] {
     while ((match = classRegex.exec(code)) !== null) {
         symbols.push(match[1]);
     }
-    
+
     return [...new Set(symbols)].slice(0, 20);
 }
 
 function extractRelevantSnippet(code: string, misconceptionId: string): string {
-    // Extract ~200 character snippet around loops, arrays, etc based on misconception
     const keywords: Record<string, string[]> = {
         'off-by-one': ['for', 'while', '[', 'length', 'size'],
         'mutation-vs-reassignment': ['push', 'pop', 'splice', '='],
@@ -725,12 +862,20 @@ function extractRelevantSnippet(code: string, misconceptionId: string): string {
         'null-checks': ['null', 'undefined', '?.', '??'],
         'scope-shadowing': ['let', 'const', 'var', '{'],
         'statefulness': ['state', 'this.', 'useState'],
-        'side-effects': ['=', 'push', 'splice']
+        'side-effects': ['=', 'push', 'splice'],
+        'operator-precedence': ['+', '-', '*', '/', '%', '&&', '||', '!'],
+        'type-coercion': ['==', '+', 'parseInt', 'toString', 'Number', 'String'],
+        'infinite-loop': ['while', 'for', 'do', 'break', 'continue'],
+        'recursion-base-case': ['return', 'if', 'function', '=>'],
+        'equality-vs-assignment': ['=', '==', '===', 'if'],
+        'variable-initialization': ['let', 'var', 'const', 'undefined', 'NaN'],
+        'boolean-logic': ['&&', '||', '!', 'true', 'false', 'if'],
+        'string-immutability': ['replace', 'slice', 'substring', 'charAt', '[']
     };
-    
+
     const searchTerms = keywords[misconceptionId] || [];
     if (searchTerms.length === 0) return '';
-    
+
     const lines = code.split('\n');
     for (let i = 0; i < lines.length; i++) {
         for (const term of searchTerms) {
@@ -742,15 +887,16 @@ function extractRelevantSnippet(code: string, misconceptionId: string): string {
             }
         }
     }
-    
+
     return '';
 }
 
 const start = async () => {
     try {
-        await fastify.listen({ port: 3000, host: '0.0.0.0' });
-        console.log('🚀 Server listening on http://0.0.0.0:3000');
-        console.log('✅ Authentication DISABLED for testing');
+        const port = parseInt(process.env.PORT || '3000');
+        await fastify.listen({ port, host: '0.0.0.0' });
+        console.log(`Server listening on http://0.0.0.0:${port}`);
+        console.log(`Authentication ${enableWhitelist ? 'ENABLED' : 'DISABLED'}`);
     } catch (err) {
         fastify.log.error(err);
         process.exit(1);

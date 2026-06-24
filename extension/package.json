@@ -1,8 +1,10 @@
 {
     "name": "socratic-ai-extension",
     "displayName": "Socratic AI Assistant",
-    "description": "A Socratic teaching assistant for coding.",
-    "version": "0.0.1",
+    "description": "A Socratic teaching assistant that guides students through programming concepts using questions, not answers.",
+    "version": "0.1.0",
+    "publisher": "socratic-ai",
+    "license": "MIT",
     "engines": {
         "vscode": "^1.85.0"
     },
@@ -54,6 +56,16 @@
                 "title": "Socratic: Set Auth Token"
             }
         ],
+        "configuration": {
+            "title": "Socratic AI",
+            "properties": {
+                "socratic.serverUrl": {
+                    "type": "string",
+                    "default": "http://localhost:3000",
+                    "description": "URL of the Socratic AI backend server"
+                }
+            }
+        },
         "keybindings": [
             {
                 "command": "socratic.openChat",

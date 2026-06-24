@@ -46,3 +46,10 @@ coverage/
 # Temporary files
 *.tmp
 .cache/
+
+# Claude Code / agent harness (local only)
+.claude/
+
+# Confidential research artifacts (keep local, not in VCS)
+feedback.txt
+*.pdf

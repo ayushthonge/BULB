@@ -14,14 +14,14 @@
   "dependencies": {
     "@fastify/cors": "^9.0.1",
     "@google/generative-ai": "^0.24.1",
-    "@supabase/supabase-js": "^2.39.3",
     "dotenv": "^16.4.1",
     "fastify": "^4.26.1",
     "fastify-cors": "^6.1.0",
-    "prom-client": "^15.1.0"
+    "pg": "^8.20.0"
   },
   "devDependencies": {
     "@types/node": "^20.11.17",
+    "@types/pg": "^8.18.0",
     "ts-node-dev": "^2.0.0",
     "typescript": "^5.3.3"
   }

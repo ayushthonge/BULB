@@ -7,6 +7,10 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 
     constructor(private readonly _context: vscode.ExtensionContext) { }
 
+    private getServerUrl(): string {
+        return vscode.workspace.getConfiguration('socratic').get('serverUrl', 'http://localhost:3000');
+    }
+
     public resolveWebviewView(
         webviewView: vscode.WebviewView,
         context: vscode.WebviewViewResolveContext,
@@ -38,7 +42,6 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
                     break;
                 }
                 case 'askAI': {
-                    // Get current editor selection or file content
                     const editor = vscode.window.activeTextEditor;
                     let context = '';
                     if (editor) {
@@ -50,14 +53,10 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
                         }
                     }
 
-                    // Send to Webview so it can send to Backend (or we can send to backend here)
-                    // Let's forward the context back to webview so React can make the API call
-                    // OR let extension make the API call. React is easier for State management.
-                    // Let's reply with context.
                     webviewView.webview.postMessage({
                         type: 'context-response',
                         value: context,
-                        originalMessage: data.value // pass back the user prompt if needed
+                        originalMessage: data.value
                     });
                     break;
                 }
@@ -81,19 +80,20 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         const scriptUri = webview.asWebviewUri(
             vscode.Uri.joinPath(this._context.extensionUri, 'dist', 'webview.js')
         );
-        // Add CSS if we have one
 
         const nonce = getNonce();
+        const serverUrl = this.getServerUrl();
 
         return `<!DOCTYPE html>
       <html lang="en">
       <head>
         <meta charset="UTF-8">
-        <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}'; connect-src 'self' http://localhost:3000;">
+        <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}'; connect-src 'self' ${serverUrl} http://localhost:3000;">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Socratic AI</title>
       </head>
       <body>
+        <script nonce="${nonce}">window.__SERVER_URL__ = '${serverUrl}';</script>
         <div id="root"></div>
         <script nonce="${nonce}" src="${scriptUri}"></script>
       </body>

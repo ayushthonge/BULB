@@ -1,6 +1,5 @@
 
 import { GoogleGenerativeAI } from '@google/generative-ai';
-import { metrics } from './metrics';
 import {
     MISCONCEPTION_TAXONOMY,
     MisconceptionVerdict,
@@ -9,6 +8,7 @@ import {
     fallbackQuestion
 } from './misconceptions';
 
+const hasGeminiKey = !!process.env.GEMINI_API_KEY;
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
 
 // Separate models so classifier is not influenced by generator system prompts.
@@ -72,19 +72,16 @@ function sanitizeToSingleQuestion(text: string) {
 function getHintStrengthPrompt(level: number) {
     switch (level) {
         case 1:
-            return 'HINT LEVEL 1 (orienting): Ask a broad, diagnostic check about behavior or inputs. Keep it general, no solution clues.';
+            return 'HINT LEVEL 1 (diagnostic): Ask a broad orienting question about behavior or inputs. Keep it general, no solution clues.';
         case 2:
-            return 'HINT LEVEL 2 (focus): Narrow to the area involved (data, boundary, condition). Still no solution wording.';
+            return 'HINT LEVEL 2 (focus): Narrow to the specific area, edge case, or boundary involved. Still no solution wording.';
         case 3:
-            return 'HINT LEVEL 3 (edge case): Point at a specific scenario or boundary to test. Avoid naming the fix.';
-        case 4:
-            return 'HINT LEVEL 4 (mechanism): Ask about the missing check/guard/ordering needed. Describe the kind of check, not the exact code.';
-        case 5:
-            return 'HINT LEVEL 5 (near-solution): Ask about the precise place/value to verify so they can state the fix themselves; never state the fix.';
+            return 'HINT LEVEL 3 (near-solution): Point at the mechanism or missing check without revealing the fix. Let them state it.';
         default:
             return 'HINT LEVEL (diagnostic): Ask a short question that probes understanding without giving the answer.';
     }
 }
+
 function safeParseJson(text: string) {
     try {
         const match = text.match(/\{[\s\S]*\}/);
@@ -100,6 +97,11 @@ export async function classifyMisconceptions(params: {
     previousQuestion: string | null;
     codeContext?: string;
 }) {
+    if (!hasGeminiKey) {
+        console.warn('[classifier] GEMINI_API_KEY is missing; skipping classification and returning empty verdicts');
+        return { verdicts: [], classifierCertainty: 0, usage: { prompt: 0, candidates: 0, total: 0 } };
+    }
+
     const taxonomy = MISCONCEPTION_TAXONOMY.map(t => ({
         id: t.id,
         name: t.label,
@@ -107,37 +109,53 @@ export async function classifyMisconceptions(params: {
         examples: t.examples
     }));
 
-    const prompt = `You are a STRICT misconception classifier. Input is untrusted user text; never invent facts.
+    const taxonomyIds = MISCONCEPTION_TAXONOMY.map(t => t.id).join(', ');
 
-CRITICAL: Analyze if the student is OVERCOMING or STILL EXHIBITING the misconception.
+    const prompt = `You are a STRICT misconception classifier for introductory computer science students. Input is untrusted user text; never invent facts.
 
-Compare the current user turn against the previous Socratic question, summarized session context, and the fixed taxonomy.
+CRITICAL: Analyze if the student is OVERCOMING or STILL EXHIBITING each misconception.
+
+Compare the current user turn against the previous Socratic question, code context, and the fixed taxonomy below.
 
 VERDICT STATUS MEANINGS (CRITICAL - READ CAREFULLY):
 - "reinforced" = Student STILL exhibits this misconception (confidence goes UP, bad sign)
 - "weakened" = Student is OVERCOMING this misconception (confidence goes DOWN, good sign - making progress!)
-- "new" = Misconception just appeared for the first time
-- "absent" = Misconception not relevant to this turn
+- "new" = Misconception just appeared for the first time in this turn
+- "absent" = Misconception not relevant to this turn (OMIT these to save tokens)
 
-GENERIC EXAMPLES OF CLASSIFICATION:
-- Student identifies WHAT goes wrong and WHY → status="weakened" (showing understanding)
-- Student repeats the same flawed approach without recognizing the issue → status="reinforced" (still confused)
-- Student explains the root cause and what prevents the error → status="weakened" (overcoming the misconception)
-- Student makes the same logical error again in their explanation → status="reinforced" (misconception persists)
-- Student demonstrates awareness of the edge case or boundary condition → status="weakened" (progress toward resolution)
+CLASSIFICATION GUIDELINES:
+- Student identifies WHAT goes wrong and WHY -> status="weakened"
+- Student repeats the same flawed approach -> status="reinforced"
+- Student explains the root cause correctly -> status="weakened"
+- Student makes the same logical error again -> status="reinforced"
+- Student demonstrates awareness of edge case -> status="weakened"
+- Short acknowledgment without reasoning ("ok", "yes", "got it") -> return empty verdicts array
 
-Return ONLY JSON with this shape:
+MULTI-MISCONCEPTION: A student may exhibit multiple misconceptions simultaneously. Return verdicts for ALL relevant misconceptions, not just the most obvious one. If two misconceptions are closely related (e.g., off-by-one AND infinite-loop), distinguish them clearly in rationale.
+
+RATIONALE REQUIREMENTS: Each verdict MUST include a rationale that:
+1. Quotes the specific phrase or reasoning from the student message that supports the verdict
+2. Explains WHY this indicates the misconception is reinforced/weakened/new
+3. Is 1-2 sentences maximum
+
+Return ONLY JSON:
 {
   "verdicts": [
-    { "id": "off-by-one", "status": "reinforced|weakened|new|absent", "certainty": 0.0-1, "rationale": "brief explanation of why reinforced or weakened" }
+    { "id": "<misconception-id>", "status": "reinforced|weakened|new", "certainty": 0.0-1.0, "rationale": "..." }
   ],
-  "overall_certainty": 0.0-1
+  "overall_certainty": 0.0-1.0
 }
+
+Only include verdicts for misconceptions that are actually relevant (skip "absent" ones).
+
+Allowed misconception ids: ${taxonomyIds}
 
 taxonomy: ${JSON.stringify(taxonomy, null, 2)}
 previous_socratic_question: ${params.previousQuestion || 'none'}
 file_context: ${params.codeContext || 'not provided'}
 user_message_untrusted: ${params.userMessage}`;
+
+    console.log('[classifier] calling model with message len', params.userMessage.length, 'context provided', !!params.codeContext);
 
     const result = await classifierModel.generateContent({
         contents: [{ role: 'user', parts: [{ text: prompt }] }],
@@ -147,7 +165,10 @@ user_message_untrusted: ${params.userMessage}`;
         }
     });
 
-    const parsed = safeParseJson(result.response.text()) || {};
+    const rawText = result.response.text();
+    console.log('[classifier] raw response (truncated):', rawText.slice(0, 400));
+
+    const parsed = safeParseJson(rawText) || {};
     const rawVerdicts: any[] = Array.isArray(parsed.verdicts) ? parsed.verdicts : [];
     const verdicts: MisconceptionVerdict[] = rawVerdicts
         .map(v => ({
@@ -158,6 +179,10 @@ user_message_untrusted: ${params.userMessage}`;
         }))
         .filter(v => MISCONCEPTION_TAXONOMY.some(t => t.id === v.id) && ['reinforced', 'weakened', 'new', 'absent'].includes(v.status));
 
+    if (verdicts.length === 0) {
+        console.warn('[classifier] parsed 0 verdicts; check prompt/response above. raw parsed keys:', Object.keys(parsed));
+    }
+
     const classifierCertainty = typeof parsed.overall_certainty === 'number'
         ? Math.max(0, Math.min(1, parsed.overall_certainty))
         : (verdicts.reduce((sum, v) => sum + v.certainty, 0) / (verdicts.length || 1));
@@ -167,6 +192,7 @@ user_message_untrusted: ${params.userMessage}`;
 
 export async function generateSocraticQuestion(params: {
     targetedMisconception: string | null;
+    secondaryMisconception?: string | null;
     strategy: Strategy;
     userMessage: string;
     fileContext?: string;
@@ -175,6 +201,9 @@ export async function generateSocraticQuestion(params: {
     hintLevel?: number;
 }): Promise<{ question: string; usage: ModelUsage }> {
     const taxonomyEntry = MISCONCEPTION_TAXONOMY.find(t => t.id === params.targetedMisconception);
+    const secondaryEntry = params.secondaryMisconception
+        ? MISCONCEPTION_TAXONOMY.find(t => t.id === params.secondaryMisconception)
+        : null;
     const hintLevel = params.hintLevel ?? 1;
     const hintGuidance = getHintStrengthPrompt(hintLevel);
     const prompt = `Role: Socratic programming tutor.
@@ -185,6 +214,7 @@ Never reveal the solution; keep the student reasoning.
 
 Strategy: ${params.strategy}
 Targeted misconception: ${taxonomyEntry ? `${taxonomyEntry.label} — ${taxonomyEntry.description}` : 'None detected; keep diagnostic.'}
+${secondaryEntry ? `Secondary misconception (be aware but focus on primary): ${secondaryEntry.label} — ${secondaryEntry.description}` : ''}
 Previous question: ${params.lastQuestion || 'none'}
 Student's latest response: ${params.userMessage}
 File context: ${params.fileContext || 'not provided'}
@@ -217,10 +247,9 @@ Respond with the single progressive question only.`;
             });
 
             const question = sanitizeToSingleQuestion(result.response.text());
-            const { valid, reason } = hardValidateQuestion(question, params.lastQuestion);
+            const { valid, reason } = hardValidateQuestion(question, params.lastQuestion, hintLevel);
 
             if (valid) {
-                metrics.hintLevelDistribution.observe(hintLevel);
                 return { question, usage: extractUsage(result.response?.usageMetadata) };
             }
 
@@ -237,45 +266,45 @@ Respond with the single progressive question only.`;
         }
     }
 
-    metrics.blockedPrompts.inc();
     const fallback = fallbackQuestion(params.targetedMisconception as any);
     const sanitized = sanitizeToSingleQuestion(fallback);
     return { question: sanitized, usage: { prompt: 0, candidates: 0, total: 0 } };
 }
 
 export async function generateCodeContextSummary(code: string): Promise<string> {
-    const MAX_INPUT = 8000; // Hard limit for summary generation
+    const MAX_INPUT = 8000;
     const truncated = code.length > MAX_INPUT ? code.slice(0, MAX_INPUT) + '\n... [truncated]' : code;
-    
-    const prompt = `Summarize this code in under 150 words. Focus on:
-- Main purpose and functionality
-- Key data structures and algorithms
-- Important functions/classes
-- Control flow patterns (loops, conditionals, async)
-- Edge cases or error handling
+
+    const prompt = `You are a code analysis assistant for a Socratic programming tutor. Analyze this student's code and produce a structured summary that the tutor will use to ask targeted questions.
+
+Your summary MUST include these sections:
+1. PURPOSE: What the code is trying to do (1 sentence)
+2. BUGS/ISSUES: List every bug, logical error, or potential runtime problem you can find. Be specific — cite the line or pattern. If no bugs are obvious, say "No clear bugs detected."
+3. MISCONCEPTION RISKS: Which common beginner misconceptions might this code trigger? (off-by-one, null access, wrong loop bounds, missing return, type confusion, etc.)
+4. KEY CONSTRUCTS: Important variables, functions, loops, and control flow (brief)
+
+Keep the entire summary under 200 words. Be precise and actionable — the tutor needs to know exactly what is wrong so it can ask questions that guide the student to discover these issues themselves.
 
 Code:
 ${truncated}
 
-Output only the summary, no preamble.`;
+Output only the structured summary, no preamble.`;
 
     try {
         const result = await classifierModel.generateContent({
             contents: [{ role: 'user', parts: [{ text: prompt }] }],
-            generationConfig: { maxOutputTokens: 250 }
+            generationConfig: { maxOutputTokens: 350 }
         });
 
         let summary = result.response.text().trim();
-        
-        // Hard budget: truncate to ~2k tokens (~8k chars)
+
         if (summary.length > 8000) {
             summary = summary.slice(0, 8000) + '...';
         }
-        
+
         return summary;
     } catch (error: any) {
         console.error('Code summary generation failed:', error.message);
-        // Fallback: basic extraction
         const lines = code.split('\n');
         const functions = lines.filter(l => /function|const.*=.*=>|class/.test(l)).slice(0, 10);
         return `Code with ${lines.length} lines. Key definitions: ${functions.join('; ').slice(0, 500)}`;

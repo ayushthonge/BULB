@@ -8,14 +8,22 @@ export type MisconceptionId =
     | 'null-checks'
     | 'scope-shadowing'
     | 'statefulness'
-    | 'side-effects';
+    | 'side-effects'
+    | 'operator-precedence'
+    | 'type-coercion'
+    | 'infinite-loop'
+    | 'recursion-base-case'
+    | 'equality-vs-assignment'
+    | 'variable-initialization'
+    | 'boolean-logic'
+    | 'string-immutability';
 
 export type VerdictStatus = 'reinforced' | 'weakened' | 'new' | 'absent';
 
 export interface MisconceptionVerdict {
     id: MisconceptionId;
     status: VerdictStatus;
-    certainty: number; // 0-1
+    certainty: number; // 0-1, kept for training data
     rationale?: string;
 }
 
@@ -79,6 +87,54 @@ export const MISCONCEPTION_TAXONOMY: { id: MisconceptionId; label: string; descr
         label: 'Side-effects and ordering',
         description: 'Order-dependent mutations cause unexpected outputs.',
         examples: ['mutating input array then reusing']
+    },
+    {
+        id: 'operator-precedence',
+        label: 'Operator precedence',
+        description: 'Confusion about order of operations: arithmetic, logical, or bitwise.',
+        examples: ['a + b * c evaluated left-to-right', '! and && precedence', 'missing parentheses']
+    },
+    {
+        id: 'type-coercion',
+        label: 'Type coercion surprises',
+        description: 'Implicit type conversion producing unexpected results.',
+        examples: ['"5" + 3 === "53"', '[] == false', 'null == undefined']
+    },
+    {
+        id: 'infinite-loop',
+        label: 'Infinite loop / missing termination',
+        description: 'Loop never terminates because exit condition is unreachable or wrong.',
+        examples: ['while(true) without break', 'counter never incremented', 'wrong direction increment']
+    },
+    {
+        id: 'recursion-base-case',
+        label: 'Recursion base case errors',
+        description: 'Missing, unreachable, or incorrect base case in recursive functions.',
+        examples: ['no return for base case', 'base case never reached', 'wrong base case value']
+    },
+    {
+        id: 'equality-vs-assignment',
+        label: 'Equality vs assignment',
+        description: 'Using = when == or === is intended, or vice versa.',
+        examples: ['if (x = 5)', '== vs === in JS', 'assignment in condition']
+    },
+    {
+        id: 'variable-initialization',
+        label: 'Uninitialized variables',
+        description: 'Reading a variable before assigning it a value.',
+        examples: ['undefined accumulator', 'using var before let declaration', 'NaN from uninitialized number']
+    },
+    {
+        id: 'boolean-logic',
+        label: 'Boolean logic errors',
+        description: "Mistakes with De Morgan's law, short-circuit evaluation, or negation.",
+        examples: ['!(a && b) vs !a && !b', 'or vs and confusion', 'double negation']
+    },
+    {
+        id: 'string-immutability',
+        label: 'String immutability',
+        description: 'Attempting to mutate a string in-place when strings are immutable.',
+        examples: ['str[0] = "X" does nothing', 'expecting .replace to modify in-place']
     }
 ];
 
@@ -166,41 +222,78 @@ export function pickTopMisconception(state: MisconceptionState) {
     return top;
 }
 
+export function pickTopMisconceptions(
+    state: MisconceptionState,
+    maxCount: number = 2,
+    minConfidence: number = 0.5
+): { id: MisconceptionId; confidence: number }[] {
+    return Array.from(state.map.entries())
+        .map(([id, confidence]) => ({ id, confidence }))
+        .filter(entry => entry.confidence >= minConfidence)
+        .sort((a, b) => b.confidence - a.confidence)
+        .slice(0, maxCount);
+}
+
 export type Strategy = 'diagnostic' | 'narrowing' | 'conceptual-contrast' | 'reflective';
 
-export function chooseStrategy(intent: 'debugging' | 'explanation' | 'unknown',
-    learnerConfidence: number,
-    topConfidence: number | null): Strategy {
-    if (topConfidence && topConfidence > 0.75) {
+export function chooseStrategy(
+    intent: 'debugging' | 'explanation' | 'unknown',
+    messageIntent: MessageIntent,
+    targetedMisconception: MisconceptionId | null
+): Strategy {
+    if (!targetedMisconception) {
+        return 'diagnostic';
+    }
+    if (messageIntent === 'solution_request') {
         return 'conceptual-contrast';
     }
-    if (intent === 'debugging') {
-        return learnerConfidence > 0.55 ? 'narrowing' : 'diagnostic';
+    if (messageIntent === 'debugging' || intent === 'debugging') {
+        return 'narrowing';
     }
-    if (intent === 'explanation') {
+    if (messageIntent === 'conceptual' || intent === 'explanation') {
         return 'reflective';
+    }
+    if (messageIntent === 'clarification') {
+        return 'diagnostic';
     }
     return 'diagnostic';
 }
 
-export type MessageIntent = 'solution_request' | 'debugging' | 'conceptual' | 'clarification';
+export type MessageIntent = 'solution_request' | 'debugging' | 'conceptual' | 'clarification' | 'off_topic';
 
 function classifyMessageIntent(message: string): MessageIntent {
-    const lower = message.toLowerCase();
+    const lower = message.toLowerCase().trim();
+    const wordCount = lower.split(/\s+/).length;
 
-    const wantsSolution = /give me|just tell|what is the answer|full solution|complete solution|show (me )?the code/.test(lower);
-    if (wantsSolution) {
+    // Short acknowledgments (< 4 words with no question mark) -> conceptual
+    if (wordCount <= 3 && !/\?/.test(message)) {
+        return 'conceptual';
+    }
+
+    // Off-topic detection: clearly unrelated to programming/code
+    if (/\b(weather|sports|movie|music|recipe|cook|football|cricket|basketball|dating|boyfriend|girlfriend|politics|election|stock|crypto|bitcoin|homework for (english|history|math|bio)|write (me )?(an? )?(essay|poem|story|email|letter)|tell (me )?(a )?joke|who (is|are) you|what('s| is) your name|are you (a |an )?(human|robot|ai|bot)|sing|play|game)\b/.test(lower) &&
+        !/\b(code|function|variable|loop|array|string|error|bug|class|method|return|parameter|argument|compile|runtime)\b/.test(lower)) {
+        return 'off_topic';
+    }
+
+    // Solution-seeking: explicit requests for answers/code
+    if (/\b(give me|just tell|what is the answer|full solution|complete solution|show (me )?the (code|answer|solution)|write (it|the code|this) for me|can you (just )?(solve|fix|do) (it|this)|i give up|please (just )?(tell|show|give))\b/.test(lower)) {
         return 'solution_request';
     }
 
-    const debuggingSignals = /error|exception|stack trace|bug|fails?|fix|debug|crash/.test(lower) || /\?/.test(message);
-    if (debuggingSignals) {
+    // Debugging: error-related or investigating behavior
+    if (/\b(error|exception|stack\s*trace|bug|fails?|fix(ed|ing)?|debug(ging)?|crash(es|ed)?|broken|wrong output|doesn'?t work|not working|unexpected|infinite loop|off by one|index out|segfault|runtime)\b/.test(lower)) {
         return 'debugging';
     }
 
-    const clarificationSignals = /meaning|clarif(y|ication)|what do you mean|which one/.test(lower);
-    if (clarificationSignals) {
+    // Clarification: asking about the tutor's question or terminology
+    if (/\b(what do you mean|which one|clarif(y|ication)|can you (rephrase|explain the question)|i don'?t understand (the|your) question|what (exactly|specifically))\b/.test(lower)) {
         return 'clarification';
+    }
+
+    // Code snippet detection: if message contains code-like content, likely debugging
+    if (/[{};]|=>|function\s|const\s|let\s|var\s|for\s*\(|while\s*\(|if\s*\(/.test(message)) {
+        return 'debugging';
     }
 
     return 'conceptual';
@@ -208,27 +301,79 @@ function classifyMessageIntent(message: string): MessageIntent {
 
 export function inferIntentAndConfidence(message: string, priorConfidence: number) {
     const lower = message.toLowerCase();
+    const wordCount = lower.split(/\s+/).length;
     let intent: 'debugging' | 'explanation' | 'unknown' = 'unknown';
 
-    if (/[?]/.test(message)) {
+    if (/\b(error|bug|fix|crash|broken|wrong|fails?|debug)\b/.test(lower)) {
         intent = 'debugging';
     }
-    if (lower.includes('explain') || lower.includes('why')) {
+    if (/\b(explain|why|how does|what does|understand|concept|meaning)\b/.test(lower)) {
         intent = 'explanation';
     }
 
     let confidence = priorConfidence;
-    if (lower.includes("i'm not sure") || lower.includes('confused') || lower.includes('stuck')) {
-        confidence -= 0.08;
-    }
-    if (lower.includes('i think') || lower.includes('maybe')) {
-        confidence += 0.04;
-    }
-    confidence = CLAMP(confidence);
+    let signalDirection = 0; // +1 positive, -1 negative, 0 neutral
 
+    // --- STRONG POSITIVE SIGNALS (understanding demonstrated) ---
+
+    // Student identifies the problem themselves
+    if (/\b(the (problem|issue|bug) is|i (see|found|noticed) (that|the)|it('s| is) because|the reason is)\b/.test(lower)) {
+        confidence += 0.15;
+        signalDirection = 1;
+    }
+    // Student explains their reasoning (substantive: at least 10 chars after trigger)
+    if (/\b(i think .{10,}because|so (that|it) (means|would)|if .{5,} then)\b/.test(lower)) {
+        confidence += 0.12;
+        signalDirection = 1;
+    }
+    // Student tests a hypothesis
+    if (/\b(what if (i|we)|let me try|i('ll| will) try|would it work if|if i change)\b/.test(lower)) {
+        confidence += 0.10;
+        signalDirection = 1;
+    }
+    // Student corrects themselves (strongest positive signal)
+    if (/\b(wait,? (actually|no)|i was wrong|actually,? it('s| is)|oh,? i see|now i (understand|get it))\b/.test(lower)) {
+        confidence += 0.18;
+        signalDirection = 1;
+    }
+    // Student uses correct technical terminology in context (>8 words to avoid trivial use)
+    if (wordCount > 8 && /\b(null check|base case|off.by.one|boundary|edge case|return value|scope|initialization|termination condition|type coercion|operator precedence|boolean logic|recursion|immutable)\b/.test(lower)) {
+        confidence += 0.08;
+        signalDirection = 1;
+    }
+
+    // --- STRONG NEGATIVE SIGNALS ---
+
+    // Total confusion
+    if (/\b(i (have no|don'?t have any) idea|completely (lost|confused)|no clue)\b/.test(lower) || /\?{2,}|\.{3,}/.test(message)) {
+        confidence -= 0.15;
+        signalDirection = -1;
+    }
+    // Asking for direct answers
+    if (/\b(just tell me|give me the answer|what('s| is) the (answer|solution|fix))\b/.test(lower)) {
+        confidence -= 0.12;
+        signalDirection = -1;
+    }
+    // Mild uncertainty
+    if (/\b(i'?m not sure|confused|stuck|i don'?t (know|understand|get))\b/.test(lower)) {
+        confidence -= 0.10;
+        signalDirection = -1;
+    }
+    // Tentative but attempting (mild positive)
+    if (/\b(i think|maybe|perhaps|possibly|could it be)\b/.test(lower)) {
+        confidence += 0.05;
+        signalDirection = signalDirection || 1;
+    }
+    // Very short non-advancing response (< 4 words, no reasoning)
+    if (wordCount <= 3 && !/\b(because|so|therefore|means)\b/.test(lower)) {
+        confidence -= 0.05;
+        signalDirection = -1;
+    }
+
+    confidence = CLAMP(confidence);
     const messageIntent = classifyMessageIntent(message);
 
-    return { intent, confidence, messageIntent };
+    return { intent, confidence, messageIntent, signalDirection };
 }
 
 export function sanitizeUserInput(input: string) {
@@ -238,36 +383,54 @@ export function sanitizeUserInput(input: string) {
         .trim();
 }
 
-export function hardValidateQuestion(question: string, previousQuestion?: string | null) {
+export function hardValidateQuestion(
+    question: string,
+    previousQuestion?: string | null,
+    hintLevel?: number
+) {
+    const level = hintLevel ?? 1;
+
+    // Dynamic length limit based on hint level
+    const maxChars = level === 1 ? 100 : level === 2 ? 130 : 160;
+    const maxWords = 25;
+
+    const wordCount = question.split(/\s+/).filter(Boolean).length;
     const multipleQuestions = (question.match(/\?/g) || []).length > 1;
-    const hasCode = /```|\bcode\b|\bclass\b|<[^>]+>/i.test(question);
+    // Only reject actual code blocks or HTML tags, not the word "class" in isolation
+    const hasCode = /```|<[^>]+>/.test(question);
     const hasSteps = /step\s+\d|first,|second,|third,/i.test(question);
-    const tooLong = question.length > 160;
+    const tooLong = question.length > maxChars;
+    const tooManyWords = wordCount > maxWords;
     const hasExplanation = /because|for example|you should/i.test(question);
 
-    // Check if question is too similar to previous
     let isSameAsPrevious = false;
     if (previousQuestion) {
         const normalizedCurrent = question.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
         const normalizedPrevious = previousQuestion.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
-        
-        // Exact match or very high similarity
+
         if (normalizedCurrent === normalizedPrevious) {
             isSameAsPrevious = true;
         } else {
-            // Check if 80%+ of words are the same
             const currentWords = new Set(normalizedCurrent.split(/\s+/));
             const previousWords = new Set(normalizedPrevious.split(/\s+/));
             const intersection = new Set([...currentWords].filter(w => previousWords.has(w)));
             const similarity = intersection.size / Math.max(currentWords.size, previousWords.size);
-            if (similarity > 0.8) {
+            if (similarity > 0.68) {
                 isSameAsPrevious = true;
             }
         }
     }
 
-    const valid = !multipleQuestions && !hasCode && !hasSteps && !tooLong && !hasExplanation && !isSameAsPrevious;
-    const reason = valid ? null : isSameAsPrevious ? 'Question too similar to previous' : 'Question validation failed (multiple questions / code / steps / explanation / too long)';
+    const valid = !multipleQuestions && !hasCode && !hasSteps && !tooLong && !tooManyWords && !hasExplanation && !isSameAsPrevious;
+
+    let reason: string | null = null;
+    if (!valid) {
+        if (isSameAsPrevious) reason = 'Question too similar to previous';
+        else if (tooLong) reason = `Question exceeds ${maxChars} chars for hint level ${level}`;
+        else if (tooManyWords) reason = `Question exceeds ${maxWords} words`;
+        else reason = 'Question validation failed (multiple questions / code / steps / explanation)';
+    }
+
     return { valid, reason };
 }
 
@@ -293,6 +456,22 @@ export function fallbackQuestion(targeted: MisconceptionId | null): string {
             return 'When is the state reset between runs?';
         case 'side-effects':
             return 'What else changes when this code executes in this order?';
+        case 'operator-precedence':
+            return 'Which operation executes first in that expression?';
+        case 'type-coercion':
+            return 'What type does each operand have before that operation?';
+        case 'infinite-loop':
+            return 'Under what condition does this loop stop?';
+        case 'recursion-base-case':
+            return 'When does the recursion stop calling itself?';
+        case 'equality-vs-assignment':
+            return 'Is that symbol checking a value or changing it?';
+        case 'variable-initialization':
+            return 'What value does that variable hold before this line runs?';
+        case 'boolean-logic':
+            return 'What does that combined condition actually evaluate to?';
+        case 'string-immutability':
+            return 'Does that operation change the original string or create a new one?';
         default:
             return lookup?.label ? `What is uncertain about ${lookup.label.toLowerCase()} here?` : 'What part needs another look?';
     }

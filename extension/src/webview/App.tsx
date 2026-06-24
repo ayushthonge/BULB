@@ -5,22 +5,34 @@ import './App.css';
 declare global {
     interface Window {
         acquireVsCodeApi: () => any;
+        __SERVER_URL__?: string;
     }
 }
 
 const vscode = window.acquireVsCodeApi();
+const SERVER_URL = (window as any).__SERVER_URL__ || 'http://localhost:3000';
+
+function renderMessage(text: string) {
+    const html = text
+        .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+        .replace(/`([^`]+)`/g, '<code>$1</code>')
+        .replace(/\n/g, '<br />');
+    return <span dangerouslySetInnerHTML={{ __html: html }} />;
+}
 
 export default function App() {
     const [messages, setMessages] = useState<{ role: string, parts: string, type?: 'question' | 'resolution' }[]>([]);
     const [input, setInput] = useState('');
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
+    const [authToken, setAuthToken] = useState<string | null>(null);
     const [currentContext, setCurrentContext] = useState<string>('');
     const [contextHash, setContextHash] = useState<string>('');
     const [contextId, setContextId] = useState<string | null>(null);
     const [sessionId, setSessionId] = useState<string>(() => generateSessionId());
     const [queryId, setQueryId] = useState<string | null>(null);
     const [isResolved, setIsResolved] = useState(false);
+    const [connected, setConnected] = useState<boolean | null>(null);
     const turnIndexRef = useRef<number>(0);
     const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -32,25 +44,66 @@ export default function App() {
         scrollToBottom();
     }, [messages]);
 
+    // Connection status check
+    useEffect(() => {
+        const checkHealth = async () => {
+            try {
+                const res = await fetch(`${SERVER_URL}/health`, { signal: AbortSignal.timeout(5000) });
+                setConnected(res.ok);
+            } catch {
+                setConnected(false);
+            }
+        };
+        checkHealth();
+        const interval = setInterval(checkHealth, 30000);
+        return () => clearInterval(interval);
+    }, []);
+
     useEffect(() => {
         const handleMessage = (event: MessageEvent) => {
             const message = event.data;
             if (message.type === 'context-response') {
                 const context = message.value;
+                const lineCount = context ? context.split('\n').length : 0;
+
+                if (lineCount > 60) {
+                    setMessages(prev => [...prev, {
+                        role: 'assistant',
+                        parts: `Your code is ${lineCount} lines long. Please select up to 60 lines to focus on. Highlight the relevant section in your editor and try again.`
+                    }]);
+                    setLoading(false);
+                    return;
+                }
+
                 const hash = hashString(context);
-                
                 setCurrentContext(context);
                 setContextHash(hash);
-                
+
                 const userPrompt = message.originalMessage;
                 if (userPrompt) {
                     sendToBackend(userPrompt, context, hash);
                 }
+            } else if (message.type === 'token-response') {
+                setAuthToken(message.value ? String(message.value) : null);
             }
         };
         window.addEventListener('message', handleMessage);
         return () => window.removeEventListener('message', handleMessage);
     }, [messages]);
+
+    useEffect(() => {
+        vscode.postMessage({ type: 'getToken' });
+    }, []);
+
+    function formatError(status: number, message: string): string {
+        switch (status) {
+            case 401: return "Authentication failed. Use Command Palette > 'Socratic: Set Auth Token'";
+            case 413: return message || 'Code context is too large. Select a smaller portion (max 60 lines).';
+            case 429: return 'Too many requests. Please wait a moment and try again.';
+            case 500: return 'Server error. Please try again.';
+            default: return message || 'Something went wrong.';
+        }
+    }
 
     const handleSend = () => {
         if (!input.trim() || isResolved) return;
@@ -63,7 +116,6 @@ export default function App() {
         setError(null);
         turnIndexRef.current += 1;
 
-        // If we have context, send immediately. Otherwise ask for it.
         if (currentContext) {
             sendToBackend(currentInput, currentContext, contextHash, newMessages);
         } else {
@@ -78,10 +130,11 @@ export default function App() {
         setLoading(true);
         setError(null);
         try {
-            const res = await fetch('http://localhost:3000/query/start', {
+            const res = await fetch(`${SERVER_URL}/query/start`, {
                 method: 'POST',
                 headers: {
-                    'Content-Type': 'application/json'
+                    'Content-Type': 'application/json',
+                    ...(authToken ? { 'Authorization': `Bearer ${authToken}` } : {})
                 },
                 body: JSON.stringify({
                     session_id: sessionId
@@ -90,7 +143,7 @@ export default function App() {
 
             if (!res.ok) {
                 const errData = await res.json().catch(() => ({ error: 'Unknown error' }));
-                throw new Error(errData.error || `Server Error: ${res.status}`);
+                throw Object.assign(new Error(errData.error || `Server Error: ${res.status}`), { status: res.status });
             }
 
             const data = await res.json();
@@ -105,7 +158,7 @@ export default function App() {
             turnIndexRef.current = 0;
         } catch (err: any) {
             console.error('Start query error:', err);
-            setError(err.message || 'Failed to start new query');
+            setError(err.status ? formatError(err.status, err.message) : 'Cannot reach the server. Check your internet connection.');
         } finally {
             setLoading(false);
         }
@@ -114,16 +167,17 @@ export default function App() {
     const sendToBackend = async (prompt: string, context: string, hash: string, historyOverride?: { role: string; parts: string }[]) => {
         try {
             const ensureQueryId = queryId || (await (async () => {
-                const res = await fetch('http://localhost:3000/query/start', {
+                const res = await fetch(`${SERVER_URL}/query/start`, {
                     method: 'POST',
                     headers: {
-                        'Content-Type': 'application/json'
+                        'Content-Type': 'application/json',
+                        ...(authToken ? { 'Authorization': `Bearer ${authToken}` } : {})
                     },
                     body: JSON.stringify({ session_id: sessionId })
                 });
                 if (!res.ok) {
                     const errData = await res.json().catch(() => ({ error: 'Unknown error' }));
-                    throw new Error(errData.error || `Server Error: ${res.status}`);
+                    throw Object.assign(new Error(errData.error || `Server Error: ${res.status}`), { status: res.status });
                 }
                 const data = await res.json();
                 if (data.session_id && data.session_id !== sessionId) {
@@ -135,10 +189,11 @@ export default function App() {
                 return data.query_id as string;
             })());
 
-            const res = await fetch('http://localhost:3000/chat', {
+            const res = await fetch(`${SERVER_URL}/chat`, {
                 method: 'POST',
                 headers: {
-                    'Content-Type': 'application/json'
+                    'Content-Type': 'application/json',
+                    ...(authToken ? { 'Authorization': `Bearer ${authToken}` } : {})
                 },
                 body: JSON.stringify({
                     message: prompt,
@@ -154,7 +209,7 @@ export default function App() {
 
             if (!res.ok) {
                 const errData = await res.json().catch(() => ({ error: 'Unknown error' }));
-                throw new Error(errData.error || `Server Error: ${res.status}`);
+                throw Object.assign(new Error(errData.error || `Server Error: ${res.status}`), { status: res.status });
             }
 
             const data = await res.json();
@@ -169,7 +224,6 @@ export default function App() {
                 setContextId(data.context_id);
             }
             if (data.context_changed) {
-                // Server regenerated summary, update hash
                 setContextHash(data.context_hash || contextHash);
             }
 
@@ -182,8 +236,10 @@ export default function App() {
             }
         } catch (err: any) {
             console.error('Chat error:', err);
-            const errorMsg = err.message || 'Connection failed';
-            setMessages(prev => [...prev, { role: 'assistant', parts: `Error: ${errorMsg}\n\nMake sure the backend server is running on http://localhost:3000` }]);
+            const errorMsg = err.status
+                ? formatError(err.status, err.message)
+                : 'Cannot reach the server. Check your internet connection.';
+            setMessages(prev => [...prev, { role: 'assistant', parts: `Error: ${errorMsg}` }]);
             setError(errorMsg);
         } finally {
             setLoading(false);
@@ -196,10 +252,11 @@ export default function App() {
         setError(null);
 
         try {
-            const res = await fetch('http://localhost:3000/query/resolve', {
+            const res = await fetch(`${SERVER_URL}/query/resolve`, {
                 method: 'POST',
                 headers: {
-                    'Content-Type': 'application/json'
+                    'Content-Type': 'application/json',
+                    ...(authToken ? { 'Authorization': `Bearer ${authToken}` } : {})
                 },
                 body: JSON.stringify({
                     session_id: sessionId,
@@ -209,20 +266,19 @@ export default function App() {
 
             if (!res.ok) {
                 const errData = await res.json().catch(() => ({ error: 'Unknown error' }));
-                throw new Error(errData.error || `Server Error: ${res.status}`);
+                throw Object.assign(new Error(errData.error || `Server Error: ${res.status}`), { status: res.status });
             }
 
             const data = await res.json();
             if (data.response?.text) {
                 setMessages(prev => [...prev, { role: 'assistant', parts: data.response.text, type: data.response.type }]);
             }
-            if (data.summary) {
-                setMessages(prev => [...prev, { role: 'assistant', parts: `Summary: ${JSON.stringify(data.summary, null, 2)}`, type: 'resolution' }]);
-            }
             setIsResolved(true);
         } catch (err: any) {
             console.error('Resolve error:', err);
-            const errorMsg = err.message || 'Resolution failed';
+            const errorMsg = err.status
+                ? formatError(err.status, err.message)
+                : 'Cannot reach the server. Check your internet connection.';
             setMessages(prev => [...prev, { role: 'assistant', parts: `Error: ${errorMsg}` }]);
             setError(errorMsg);
         } finally {
@@ -230,21 +286,12 @@ export default function App() {
         }
     };
 
-    const clearChat = () => {
-        setMessages([]);
-        setError(null);
-        turnIndexRef.current = 0;
-        setQueryId(null);
-        setContextId(null);
-        setContextHash('');
-        setIsResolved(false);
-    };
-
     return (
         <div className="app-container">
             <div className="app-header">
                 <div className="header-left">
                     <div className="app-title">Socratic AI</div>
+                    <span className={`status-dot ${connected === true ? 'status-connected' : connected === false ? 'status-disconnected' : 'status-unknown'}`} title={connected === true ? 'Connected' : connected === false ? 'Disconnected' : 'Checking...'} />
                 </div>
                 <div className="header-actions">
                     {messages.length > 0 && (
@@ -253,13 +300,8 @@ export default function App() {
                         </button>
                     )}
                     {messages.length > 0 && (
-                        <button onClick={handleResolve} className="resolve-btn" title="Mark query resolved" disabled={loading || isResolved}>
-                            Query Resolved
-                        </button>
-                    )}
-                    {messages.length > 0 && (
-                        <button onClick={clearChat} className="clear-btn" title="Clear chat">
-                            Clear
+                        <button onClick={handleResolve} className="resolve-btn" title="Mark as understood" disabled={loading || isResolved}>
+                            I Understand
                         </button>
                     )}
                 </div>
@@ -267,23 +309,34 @@ export default function App() {
 
             {error && (
                 <div className="error-message">
-                    Error: {error}
+                    {error}
                 </div>
             )}
 
             <div className="messages-container">
                 {messages.length === 0 ? (
                     <div className="empty-state">
-                        <div className="empty-state-title">How can I help you today?</div>
-                        <div className="empty-state-description">
-                            Ask anything about the code you have open
-                        </div>
+                        {authToken ? (
+                            <>
+                                <div className="empty-state-title">How can I help you today?</div>
+                                <div className="empty-state-description">
+                                    Ask anything about the code you have open
+                                </div>
+                            </>
+                        ) : (
+                            <>
+                                <div className="empty-state-title">Set up your auth token</div>
+                                <div className="empty-state-description">
+                                    Use Command Palette (Ctrl+Shift+P) &gt; "Socratic: Set Auth Token" with the token provided by your instructor.
+                                </div>
+                            </>
+                        )}
                     </div>
                 ) : (
                     messages.map((m, i) => (
                         <div key={i} className={`message message-${m.role} ${m.type === 'resolution' ? 'message-resolution' : ''}`}>
                             <div className="message-bubble">
-                                {m.parts}
+                                {renderMessage(m.parts)}
                             </div>
                         </div>
                     ))
@@ -307,7 +360,7 @@ export default function App() {
                         }
                     }}
                     className="message-input"
-                    placeholder={isResolved ? 'This conversation is resolved. Clear to start a new one.' : 'Ask a question... (Shift+Enter for new line)'}
+                    placeholder={isResolved ? 'Query resolved. Click "New Query" to continue.' : 'Ask a question... (Shift+Enter for new line)'}
                     disabled={loading || isResolved}
                     rows={2}
                 />
@@ -331,7 +384,7 @@ function hashString(str: string): string {
     for (let i = 0; i < str.length; i++) {
         const char = str.charCodeAt(i);
         hash = ((hash << 5) - hash) + char;
-        hash = hash & hash; // Convert to 32bit integer
+        hash = hash & hash;
     }
     return hash.toString(16);
 }

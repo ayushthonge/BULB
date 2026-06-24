@@ -1,55 +1,29 @@
-
-import { createClient } from '@supabase/supabase-js';
 import dotenv from 'dotenv';
 import path from 'path';
-// import fetch from 'node-fetch'; // Using native fetch
 
-
-// Load environment variables
 dotenv.config({ path: path.resolve(__dirname, '../../.env') });
 
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_SERVICE_KEY;
-
-if (!supabaseUrl || !supabaseKey) {
-    console.error('Missing SUPABASE_URL or SUPABASE_SERVICE_KEY');
-    process.exit(1);
-}
-
-const supabase = createClient(supabaseUrl, supabaseKey);
-
 async function testChatFlow() {
-    console.log('1. Authenticating with Supabase...');
-    const email = 'ayush.thonge_ug2025@ashoka.edu.in';
-    const password = 'Ayush@Thonge72';
+    const token = process.argv[2] || process.env.TEST_TOKEN;
+    const serverUrl = process.argv[3] || 'http://localhost:3000';
 
-    const { data, error } = await supabase.auth.signInWithPassword({
-        email,
-        password,
-    });
+    console.log('Testing /chat endpoint...');
+    console.log('Server:', serverUrl);
+    console.log('Token:', token ? token.substring(0, 8) + '...' : '(none — auth disabled)');
 
-    if (error || !data.session) {
-        console.error('Login Failed:', error?.message);
-        return;
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
     }
 
-    const token = data.session.access_token;
-    console.log('Authentication Successful!');
-    console.log('Token obtained (starts with):', token.substring(0, 15) + '...');
-
-    console.log('\n2. Testing /chat endpoint...');
-
     try {
-        const response = await fetch('http://localhost:3000/chat', {
+        const response = await fetch(`${serverUrl}/chat`, {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${token}`
-            },
+            headers,
             body: JSON.stringify({
-                message: "Explain what a binary search tree is in one sentence.",
+                message: "I think arrays and linked lists are the same thing, right?",
                 history: [],
-                context: "const bst = new BST();"
+                context: "int arr[10];\nstruct Node { int data; Node* next; };"
             })
         });
 
@@ -60,16 +34,18 @@ async function testChatFlow() {
 
         if (response.ok) {
             console.log('\n--- SUCCESS ---');
-            console.log('Server Response:', body.response);
+            console.log('Response:', body.response);
+            console.log('Session:', body.session_id);
+            console.log('Query:', body.query_id);
+            console.log('Misconception:', body.targeted_misconception);
         } else {
             console.error('\n--- FAILURE ---');
-            console.error('Server returned error:', body);
+            console.error('Error:', body);
         }
-
     } catch (err: any) {
-        console.error('Network or Script Error:', err.message);
+        console.error('Network Error:', err.message);
         if (err.code === 'ECONNREFUSED') {
-            console.error('HINT: Is the backend server running? (npm start in server directory)');
+            console.error('HINT: Is the server running?');
         }
     }
 }
