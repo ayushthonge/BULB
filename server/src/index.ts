@@ -38,6 +38,7 @@ import {
 import { assessResolution, ResolutionState } from './resolution';
 import { dbInsert, dbUpdate, dbSelectOne, pool } from './db';
 import { inspectUserInput } from './guards/inputGuard';
+import { getAnalytics } from './analytics';
 import { config, validateConfig } from './config';
 import crypto from 'crypto';
 
@@ -800,6 +801,16 @@ fastify.post('/admin/whitelist/add', { preHandler: [authenticate, requireAdmin] 
 fastify.get('/admin/whitelist/list', { preHandler: [authenticate, requireAdmin] }, async (request: AuthenticatedRequest & any, reply) => {
     const result = await pool.query('SELECT email, role, active, created_at FROM whitelist_users ORDER BY created_at DESC');
     return { users: result.rows };
+});
+
+// Admin: research analytics — misconception persistence/decay/resolution,
+// recurrence (RQ3), questioning depth, token usage. Read-only aggregates.
+fastify.get('/admin/analytics', { preHandler: [authenticate, requireAdmin] }, async (request: AuthenticatedRequest & any, reply) => {
+    try {
+        return await getAnalytics();
+    } catch (err: any) {
+        return reply.code(500).send({ error: config.isProd ? 'Analytics unavailable' : err?.message });
+    }
 });
 
 // End session explicitly
