@@ -398,7 +398,8 @@ fastify.post('/chat', { preHandler: authPreHandlers }, async (request: Authentic
         const { verdicts, classifierCertainty, usage: classifierUsage } = await classifyMisconceptions({
             userMessage: sanitizedMessage,
             previousQuestion: query.state.lastQuestion,
-            codeContext: classifierContext ?? undefined
+            codeContext: classifierContext ?? undefined,
+            activeMisconceptions: Array.from(query.state.map.keys())
         });
 
         const update = applyVerdicts(query.state, verdicts);

@@ -5,6 +5,9 @@ import {
     createSessionState,
     detectLearnerSignals,
     pickTopMisconception,
+    selectCandidateMisconceptions,
+    compactTaxonomyLines,
+    CORE_MISCONCEPTIONS,
     NEUTRAL_CONFIDENCE,
 } from '../misconceptions';
 
@@ -82,4 +85,40 @@ test('unmentioned misconceptions decay over turns', () => {
     applyVerdicts(state, [{ id: 'type-coercion', status: 'new', certainty: 0.6 }]);
     const after = state.map.get('scope-shadowing')!;
     assert.ok(after < before, 'unmentioned misconception should decay');
+});
+
+// ---------------------------------------------------------------------------
+// Token optimization: candidate selection + compact serialization
+// ---------------------------------------------------------------------------
+
+test('selectCandidateMisconceptions prioritizes active, then keyword matches, then core', () => {
+    const candidates = selectCandidateMisconceptions({
+        message: 'my recursive function never stops and overflows the stack',
+        active: ['null-checks'],
+        max: 8,
+    });
+    assert.equal(candidates[0], 'null-checks', 'active misconception should come first');
+    assert.ok(candidates.includes('recursion-base-case'), 'keyword match should be selected');
+    assert.ok(candidates.includes('infinite-loop'));
+    // Core set is always represented.
+    for (const core of CORE_MISCONCEPTIONS) {
+        assert.ok(candidates.includes(core) || candidates.length >= 8);
+    }
+});
+
+test('selectCandidateMisconceptions respects the max cap', () => {
+    const candidates = selectCandidateMisconceptions({
+        message: 'index bound null undefined recursion async await type coercion boolean string',
+        max: 5,
+    });
+    assert.ok(candidates.length <= 5);
+});
+
+test('compactTaxonomyLines emits one short line per misconception', () => {
+    const lines = compactTaxonomyLines(['off-by-one', 'null-checks']);
+    const split = lines.split('\n');
+    assert.equal(split.length, 2);
+    assert.match(split[0], /^- off-by-one \(.+\): .+/);
+    // Compact form must be far smaller than the full JSON dump it replaces.
+    assert.ok(lines.length < 400);
 });

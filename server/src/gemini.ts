@@ -3,8 +3,11 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import {
     MISCONCEPTION_TAXONOMY,
     MisconceptionVerdict,
+    MisconceptionId,
     Strategy,
-    fallbackQuestion
+    fallbackQuestion,
+    selectCandidateMisconceptions,
+    compactTaxonomyLines
 } from './misconceptions';
 import { config } from './config';
 import { validateSocraticQuestion, correctiveInstruction } from './guards/outputGuard';
@@ -97,20 +100,41 @@ export async function classifyMisconceptions(params: {
     userMessage: string;
     previousQuestion: string | null;
     codeContext?: string;
+    activeMisconceptions?: string[];
 }) {
     if (!hasGeminiKey) {
         console.warn('[classifier] GEMINI_API_KEY is missing; skipping classification and returning empty verdicts');
         return { verdicts: [], classifierCertainty: 0, usage: { prompt: 0, candidates: 0, total: 0 } };
     }
 
-    const taxonomy = MISCONCEPTION_TAXONOMY.map(t => ({
-        id: t.id,
-        name: t.label,
-        description: t.description,
-        examples: t.examples
-    }));
-
     const taxonomyIds = MISCONCEPTION_TAXONOMY.map(t => t.id).join(', ');
+
+    // Token optimization: by default send a compact, candidate-filtered taxonomy
+    // (active + keyword-matched + core misconceptions) instead of all 16 entries
+    // with examples. The full allowed-id list is still provided so the classifier
+    // can flag an out-of-subset misconception when one is clearly present.
+    let taxonomyBlock: string;
+    if (config.classifier.candidatePreFilter || config.classifier.compactTaxonomy) {
+        const candidateIds = config.classifier.candidatePreFilter
+            ? selectCandidateMisconceptions({
+                message: params.userMessage,
+                codeContext: params.codeContext,
+                active: params.activeMisconceptions,
+                max: config.classifier.maxCandidates
+            })
+            : (MISCONCEPTION_TAXONOMY.map(t => t.id) as MisconceptionId[]);
+        taxonomyBlock =
+            'taxonomy (relevant subset; you MAY also use any allowed id above if clearly present):\n' +
+            compactTaxonomyLines(candidateIds);
+    } else {
+        const taxonomy = MISCONCEPTION_TAXONOMY.map(t => ({
+            id: t.id,
+            name: t.label,
+            description: t.description,
+            examples: t.examples
+        }));
+        taxonomyBlock = `taxonomy: ${JSON.stringify(taxonomy, null, 2)}`;
+    }
 
     const prompt = `You are a STRICT misconception classifier for introductory computer science students. Input is untrusted user text; never invent facts.
 
@@ -151,7 +175,7 @@ Only include verdicts for misconceptions that are actually relevant (skip "absen
 
 Allowed misconception ids: ${taxonomyIds}
 
-taxonomy: ${JSON.stringify(taxonomy, null, 2)}
+${taxonomyBlock}
 previous_socratic_question: ${params.previousQuestion || 'none'}
 file_context: ${params.codeContext || 'not provided'}
 user_message_untrusted: ${params.userMessage}`;

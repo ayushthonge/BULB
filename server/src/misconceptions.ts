@@ -140,6 +140,83 @@ export const MISCONCEPTION_TAXONOMY: { id: MisconceptionId; label: string; descr
     }
 ];
 
+/**
+ * Natural-language + code keywords used to pre-select which misconceptions are
+ * even plausible for a given turn, so the classifier prompt can carry a handful
+ * of relevant taxonomy entries instead of all 16 every turn (big token saving).
+ */
+export const MISCONCEPTION_KEYWORDS: Record<MisconceptionId, string[]> = {
+    'off-by-one': ['off by one', 'index', 'bound', 'last element', 'first element', 'length', 'range', '<=', 'out of range', 'out of bounds'],
+    'mutation-vs-reassignment': ['mutate', 'mutation', 'reassign', 'append', 'push', 'in place', 'copy', 'reference', 'modify', 'spread'],
+    'return-vs-print': ['return', 'print', 'console.log', 'output', 'printed', 'returns nothing', 'none', 'logs'],
+    'async-vs-parallel': ['async', 'await', 'parallel', 'concurren', 'promise', 'thread', 'blocking', 'event loop'],
+    'null-checks': ['null', 'undefined', 'none', 'optional', 'cannot read', 'property of', 'nonetype', 'nullpointer'],
+    'scope-shadowing': ['scope', 'shadow', 'global', 'local variable', 'not defined', 'outside the', 'closure'],
+    'statefulness': ['state', 'reset', 'persist', 'accumulator', 'cache', 'between calls', 'stale'],
+    'side-effects': ['side effect', 'mutates', 'in order', 'modifies the', 'changes the input'],
+    'operator-precedence': ['precedence', 'order of operations', 'parenthes', 'evaluat', 'bodmas'],
+    'type-coercion': ['coercion', 'type', 'string', 'number', 'concat', 'convert', 'parseint', 'typeof'],
+    'infinite-loop': ['infinite', 'never stops', 'hangs', 'forever', 'termination', 'break', "doesn't stop", 'does not stop'],
+    'recursion-base-case': ['recursion', 'recursive', 'base case', 'stack overflow', 'stops calling', 'maximum recursion'],
+    'equality-vs-assignment': ['assignment', 'equality', 'comparison', '==', '===', 'assign', 'condition', 'single equals'],
+    'variable-initialization': ['initialize', 'uninitialized', 'undefined', 'default value', 'nan', 'not assigned'],
+    'boolean-logic': ['boolean', 'and', ' or ', ' not ', '&&', '||', 'de morgan', 'negation', 'truthy', 'falsy'],
+    'string-immutability': ['immutable', 'modify string', 'change the string', 'charat', 'replace', 'strings are'],
+};
+
+/** The coarse-grained core set highlighted in the paper — always in scope. */
+export const CORE_MISCONCEPTIONS: MisconceptionId[] = [
+    'off-by-one',
+    'mutation-vs-reassignment',
+    'return-vs-print',
+    'async-vs-parallel',
+];
+
+/**
+ * Select the misconceptions worth describing to the classifier this turn:
+ * those already active for the learner, those whose keywords appear in the
+ * message or code, plus the core set, capped at `max`. Active misconceptions
+ * take priority so an in-progress conceptual thread is never dropped.
+ */
+export function selectCandidateMisconceptions(params: {
+    message: string;
+    codeContext?: string | null;
+    active?: string[];
+    max?: number;
+}): MisconceptionId[] {
+    const max = params.max ?? 8;
+    const haystack = `${params.message || ''}\n${params.codeContext || ''}`.toLowerCase();
+
+    const ordered: MisconceptionId[] = [];
+    const add = (id: MisconceptionId) => {
+        if (!ordered.includes(id)) ordered.push(id);
+    };
+
+    // 1. Active misconceptions first (validated against the taxonomy).
+    (params.active || []).forEach(id => {
+        if (MISCONCEPTION_TAXONOMY.some(t => t.id === id)) add(id as MisconceptionId);
+    });
+
+    // 2. Keyword matches from the utterance / code.
+    (Object.keys(MISCONCEPTION_KEYWORDS) as MisconceptionId[]).forEach(id => {
+        if (MISCONCEPTION_KEYWORDS[id].some(kw => haystack.includes(kw))) add(id);
+    });
+
+    // 3. Core set fills any remaining room.
+    CORE_MISCONCEPTIONS.forEach(add);
+
+    return ordered.slice(0, max);
+}
+
+/** Compact, low-token taxonomy serialization for the classifier prompt. */
+export function compactTaxonomyLines(ids: MisconceptionId[]): string {
+    return ids
+        .map(id => MISCONCEPTION_TAXONOMY.find(t => t.id === id))
+        .filter((t): t is (typeof MISCONCEPTION_TAXONOMY)[number] => !!t)
+        .map(t => `- ${t.id} (${t.label}): ${t.description}`)
+        .join('\n');
+}
+
 const CLAMP = (n: number) => Math.min(1, Math.max(0, n));
 
 // Pedagogical thresholds are owned by config.ts (env-overridable) so the values
