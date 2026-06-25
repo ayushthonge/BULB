@@ -1,72 +1,76 @@
-# 🧠 Socratic AI - VS Code Extension
+# Socratic AI
 
-A VS Code extension that guides you through coding problems using Socratic questioning.
+A VS Code tutor for programming students that **helps by asking questions, never
+by giving answers.** It keeps a stateful model of the misconceptions a learner is
+exhibiting and persists on them across turns until they resolve — scaffolding
+productive struggle instead of short-circuiting it.
 
-## 🚀 Quick Setup
+Based on the ITiCSE 2026 paper *“A Good Rubber Duck Does Not Quack: Designing
+Socratic Scaffolding in AI Tutors.”*
 
-### 1. Start the Backend
-```powershell
-cd server
-npm install
-npm run dev
+## Why this design
+
+LLM coding assistants are optimized to hand over solutions, which undermines the
+struggle that conceptual learning requires. Socratic AI instead:
+
+- **withholds answers by construction** — the model is an *untrusted generator*
+  whose every output is validated to be a single short question with no code,
+  fix, or explanation;
+- **tracks misconceptions statefully** — bounded confidence updates per turn, so
+  the tutor keeps probing a real conceptual gap rather than accepting surface
+  correctness;
+- **knows when it's done** — it automatically detects when a query is resolved
+  (or when a learner is stuck) from signals it already has.
+
+## Repository layout
+
 ```
-**Keep this terminal running!**
-
-### 2. Launch Extension
-- Open `extension` folder in VS Code
-- Press **F5**
-- Extension Development Host window will open
-
-### 3. Use the Extension
-1. Click "📋 Grab Current File Context" button to capture your code
-2. Type your question
-3. Press Send
-4. Get Socratic guidance!
-
-## ✨ Features
-
-- 🎓 **Socratic Method**: AI asks guiding questions instead of giving direct answers
-- 📋 **Easy Context**: One-click button to grab your current file
-- 💬 **Clean UI**: Modern, responsive chat interface
-- 🚀 **No Auth Required**: Simplified for quick testing
-
-## 🔧 Quick Commands
-
-```powershell
-# Backend
-cd server
-npm run dev              # Start server
-npm run test-gemini-chat # Test AI connection
-
-# Extension
-cd extension
-npm run compile          # Build extension
+server/      Fastify pedagogical service (all instructional logic) + Gemini + Postgres
+extension/   VS Code extension (UI only; no pedagogical reasoning)
+docs/        PLAN.md, ARCHITECTURE.md, DEPLOYMENT.md
 ```
 
-## 🐛 Troubleshooting
+## Quickstart
 
-**Error: "Connection failed"**
-→ Make sure backend server is running (`npm run dev` in server folder)
+```bash
+# server
+cd server && cp .env.example .env      # set GEMINI_API_KEY + DATABASE_URL
+npm install && npm run migrate
+npm run dev                            # http://localhost:3000  (GET /health)
+npm test                               # unit tests for guards / resolution / model
 
-**Error: "Google's AI is currently overloaded"**
-→ This is temporary! The code automatically retries with exponential backoff (1s, 2s, 4s)
-→ Usually resolves within 30-60 seconds
-→ Just wait a moment and try again
+# extension
+cd ../extension && npm install && npm run compile
+# press F5 in VS Code to launch the Extension Development Host
+```
 
-**UI looks broken**
-→ Run `npm run compile` in extension folder, then reload extension (Ctrl+R)
+## Key capabilities
 
-**No response from AI**
-→ Check server terminal for errors
+- **Guardrails beyond prompting** — a deterministic input guard (prompt-injection
+  / jailbreak / system-probe) and output guard (no code / fix / explanation /
+  multi-question / duplicates), both unit-tested.
+- **Automatic resolution tracking** — derived from existing signals, with a
+  reflective-confirmation affordance, an auto-close fast path, and a non-answer
+  off-ramp for frustrated learners.
+- **Low token cost** — candidate-filtered compact taxonomy (~89% smaller
+  classifier block) plus model-call-free fast paths.
+- **Production-ready** — central validated config, durable state with restart
+  recovery, auth caching, graceful shutdown, real health check, Docker + Render
+  deploy, idempotent migrations.
+- **Research analytics** — `/admin/analytics` + an export script for misconception
+  persistence / decay / resolution / recurrence and questioning depth.
 
----
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how it works and
+[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) to deploy.
 
-## 💡 Features
+## Configuration & thresholds
 
-- **Auto-Retry Logic**: If Google's API is overloaded, automatically retries up to 3 times
-- **Smart Backoff**: Waits 1s, then 2s, then 4s between retries
-- **Clear Error Messages**: Know exactly what's happening
+Everything tunable lives in `server/src/config.ts` and is overridable via
+environment variables (see `server/.env.example`). Pedagogical thresholds are
+documented in [docs/PLAN.md](docs/PLAN.md).
 
----
+## Reverting
 
-That's it! Simple and ready to use. 🎉
+All of the production-hardening work is on the `socratic-production-hardening`
+branch. Restore the pre-hardening state with `git checkout baseline-pre-hardening`
+(tag) or `git checkout ayush` (the original branch, untouched).

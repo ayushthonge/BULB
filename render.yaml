@@ -1,0 +1,28 @@
+# Render Blueprint for the Socratic AI server.
+# Create the database first (Neon or Render Postgres), set GEMINI_API_KEY and
+# DATABASE_URL in the dashboard (sync:false = secret, not stored in the repo).
+services:
+  - type: web
+    name: socratic-ai-server
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./server/Dockerfile
+    dockerContext: ./server
+    healthCheckPath: /health
+    # Apply idempotent migrations before each deploy goes live.
+    preDeployCommand: node dist/scripts/migrate.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: ENABLE_WHITELIST
+        value: "true"
+      - key: CORS_ORIGIN
+        value: "*"
+      - key: RATE_LIMIT_PER_USER
+        value: "10"
+      - key: RATE_LIMIT_GLOBAL
+        value: "15"
