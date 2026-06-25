@@ -2,24 +2,10 @@
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import dotenv from 'dotenv';
+import crypto from 'crypto';
 import { authenticate, requireAdmin, AuthenticatedRequest } from './auth';
 import { rateLimit } from './rateLimit';
 import { recordRequestMetric } from './telemetry';
-
-dotenv.config();
-
-const fastify = Fastify({
-    logger: true,
-    bodyLimit: 256 * 1024 // cap payload size to ~256KB to avoid oversized context uploads
-});
-
-const enableWhitelist = config.enableWhitelist;
-const authPreHandlers = enableWhitelist ? [authenticate, rateLimit] : [rateLimit];
-
-fastify.register(cors, {
-    origin: config.corsOrigin
-});
-
 import { classifyMisconceptions, generateSocraticQuestion, generateCodeContextSummary } from './gemini';
 import {
     applyVerdicts,
@@ -40,7 +26,23 @@ import { dbInsert, dbUpdate, dbSelectOne, pool } from './db';
 import { inspectUserInput } from './guards/inputGuard';
 import { getAnalytics } from './analytics';
 import { config, validateConfig } from './config';
-import crypto from 'crypto';
+
+// All imports MUST precede executable module code: in the CommonJS build the
+// require() calls run in source order, so using `config` before its import here
+// would hit a temporal-dead-zone ReferenceError at boot.
+dotenv.config();
+
+const fastify = Fastify({
+    logger: true,
+    bodyLimit: 256 * 1024 // cap payload size to ~256KB to avoid oversized context uploads
+});
+
+const enableWhitelist = config.enableWhitelist;
+const authPreHandlers = enableWhitelist ? [authenticate, rateLimit] : [rateLimit];
+
+fastify.register(cors, {
+    origin: config.corsOrigin
+});
 
 type CodeContext = {
     id: string;
